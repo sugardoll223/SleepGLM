@@ -1,0 +1,30 @@
+﻿_base_: base.yaml
+
+experiment:
+  name: mainmodel_stage2_multimodal_pretrain
+  stage: stage2_multimodal_pretrain
+  output_dir: outputs/mainmodel_stage2_multimodal_pretrain
+
+data:
+  train_files:
+    - /path/to/pretrain_train.h5
+  val_files:
+    - /path/to/pretrain_val.h5
+  test_files:
+    - /path/to/pretrain_test.h5
+  train_batch_size: 64
+  val_batch_size: 64
+
+training:
+  epochs: 80
+  disable_reference_embedding: false
+  view_dropout:
+    enabled: true
+    force_drop_modalities: []
+    random_modality_drop_prob: 0.0
+    random_channel_drop_prob: 0.0
+  optimizer:
+    lr: 3.0e-4
+  scheduler:
+    warmup_epochs: 8
+

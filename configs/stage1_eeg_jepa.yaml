@@ -1,0 +1,48 @@
+﻿_base_: base.yaml
+
+experiment:
+  name: mainmodel_stage1_eeg_jepa
+  stage: stage1_eeg_jepa
+  output_dir: outputs/mainmodel_stage1_eeg_jepa
+
+data:
+  train_files:
+    - /path/to/stage1_train.h5
+  val_files:
+    - /path/to/stage1_val.h5
+  test_files:
+    - /path/to/stage1_test.h5
+  train_batch_size: 64
+  val_batch_size: 64
+
+training:
+  epochs: 80
+  disable_reference_embedding: true
+  view_dropout:
+    enabled: false
+    force_drop_modalities: []
+    random_modality_drop_prob: 0.0
+    random_channel_drop_prob: 0.0
+  # Stage-1 LeJEPA-style objective configuration.
+  stage1_eeg_jepa:
+    enabled: true
+    global_loss_weight: 1.0
+    local_loss_weight: 1.0
+    weak_jitter_std: 0.02
+    weak_scale_low: 0.95
+    weak_scale_high: 1.05
+    weak_time_mask_prob: 0.02
+    global_views:
+      - weak_aug_view_a
+      - weak_aug_view_b
+    local_views:
+      multi_channel:
+        groups: [C, P, O]
+        num_views: 3
+      single_channel:
+        num_views: 6
+  optimizer:
+    lr: 3.0e-4
+  scheduler:
+    warmup_epochs: 8
+

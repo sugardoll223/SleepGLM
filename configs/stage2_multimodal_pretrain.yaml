@@ -1,0 +1,30 @@
+﻿_base_: pretrain.yaml
+
+experiment:
+  name: mainmodel_stage2_multimodal_pretrain
+  stage: stage2_multimodal_pretrain
+  output_dir: outputs/mainmodel_stage2_multimodal_pretrain
+
+training:
+  # Stage-2 recipe metadata (for multi-view multimodal pretraining).
+  stage2_multimodal:
+    enabled: true
+    distill_temperature: 2.0
+    loss_weights:
+      ce_global: 1.0
+      feature_align: 1.0
+      kl_align: 1.0
+      ce_local: 0.0
+    global_views:
+      - all_modalities_present
+    local_views:
+      - eeg_only
+      - eeg_plus_eog
+      - missing_any_one_or_two_modalities
+    planned_missing_views: 6
+  view_dropout:
+    enabled: true
+    force_drop_modalities: []
+    random_modality_drop_prob: 0.0
+    random_channel_drop_prob: 0.0
+

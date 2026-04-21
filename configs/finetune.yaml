@@ -1,0 +1,37 @@
+﻿_base_: base.yaml
+
+experiment:
+  name: mainmodel_stage3_downstream_finetune
+  stage: stage3_downstream_finetune
+  output_dir: outputs/mainmodel_stage3_downstream_finetune
+
+data:
+  train_files:
+    - /path/to/finetune_train.h5
+  val_files:
+    - /path/to/finetune_val.h5
+  test_files:
+    - /path/to/finetune_test.h5
+  train_batch_size: 32
+  val_batch_size: 32
+
+training:
+  # One-night sequence target length: 12h = 1440 epochs (30s per epoch).
+  epochs: 1440
+  disable_reference_embedding: false
+  view_dropout:
+    enabled: false
+    force_drop_modalities: []
+    random_modality_drop_prob: 0.0
+    random_channel_drop_prob: 0.0
+  optimizer:
+    lr: 1.0e-4
+  scheduler:
+    warmup_epochs: 3
+
+finetune:
+  pretrained_checkpoint: /path/to/pretrain_best.pt
+  resume_checkpoint: ""
+  freeze_backbone_epochs: 2
+  lr_scale_backbone: 0.3
+

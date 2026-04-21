@@ -1,0 +1,239 @@
+﻿experiment:
+  name: mainmodel_base
+  stage: pretrain
+  seed: 42
+  output_dir: outputs/mainmodel_base
+  use_sync_bn: false
+
+data:
+  train_files: []
+  val_files: []
+  test_files: []
+
+  split_key: split
+  train_split_name: train
+  val_split_name: val
+  test_split_name: test
+  sample_group_key: samples
+  continuous_signal_group_key: signals
+  continuous_label_key: hypnogram
+
+  label_key_candidates: [label, labels, y]
+  reference_key_candidates: [reference_id, ref_id]
+  dataset_id_key_candidates: [dataset_id]
+  dataset_name_key_candidates: [dataset_name, dataset]
+
+  # Optional: map file name substring to dataset name for files without dataset_name fields.
+  # Example: {"shhs": "SHHS", "sleepedf": "SLEEPEDF"}
+  file_dataset_name_overrides: {}
+
+  # Optional fixed vocabulary for stable dataset_id assignment.
+  dataset_vocab: [HSP, SHHS, MROS, MESA, PHYSIONET2018, WSC, CAP, SLEEPEDF, ISRUC]
+
+  modality_keys:
+    eeg: [eeg, EEG]
+    eog: [eog, EOG]
+    emg: [emg, EMG]
+    ecg: [ecg, ECG]
+    airflow: [airflow, AIRFLOW]
+    thoracoabdominal: [thoracoabdominal, chest_abd, belt, respiratory_effort]
+    spo2: [spo2, SPO2, SpO2, sao2, SaO2]
+    ppg: [ppg, PPG, pleth]
+
+  # Candidate field names to read channel labels from H5.
+  # Supported source: dataset key or attribute key.
+  modality_channel_name_keys:
+    eeg: [eeg_channel_names, eeg_channels, eeg_ch_names, EEG_channels]
+    eog: [eog_channel_names, eog_channels]
+    emg: [emg_channel_names, emg_channels]
+    ecg: [ecg_channel_names, ecg_channels]
+    airflow: [airflow_channel_names, airflow_channels]
+    thoracoabdominal: [thoracoabdominal_channel_names, thoracoabdominal_channels, resp_channel_names]
+    spo2: [spo2_channel_names, spo2_channels, sao2_channel_names]
+    ppg: [ppg_channel_names, ppg_channels, pleth_channel_names]
+
+  # For continuous PSG layout where channels are nested in /signals.
+  # Used to map channel names to modality when channels are not cleanly separated by groups.
+  continuous_channel_aliases:
+    eeg: [EEG, F3, F4, C3, C4, O1, O2, FPZ, PZ]
+    eog: [EOG, LOC, ROC, E1, E2]
+    emg: [EMG, CHIN, LEG, SUBMENTAL]
+    ecg: [ECG, EKG]
+    airflow: [AIRFLOW, NASAL, FLOW]
+    thoracoabdominal: [THORAX, ABDOMEN, RESP]
+    spo2: [SPO2, SAO2]
+    ppg: [PPG, PLETH]
+
+  epoch_seconds: 30
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  train_batch_size: 32
+  val_batch_size: 32
+  drop_last: true
+  strict_modality: false
+
+  normalization:
+    per_sample_zscore: true
+
+  # Channel harmonization for cross-dataset / cross-device training.
+  channel_adapter:
+    enabled: true
+    prefer_name_map: true
+    missing_channel_policy: gaussian   # gaussian | zeros
+    missing_gaussian_std: 0.05
+    modality_channel_schema:
+      eeg:
+        canonical_channels: [F3, F4, C3, C4, O1, O2]
+        alias_groups:
+          F3: [F3, F3-M2, F3-A2, F3-A1]
+          F4: [F4, F4-M1, F4-A1, F4-A2]
+          C3: [C3, C3-M2, C3-A2, FPZ-CZ]
+          C4: [C4, C4-M1, C4-A1]
+          O1: [O1, O1-M2, O1-A2, PZ-OZ]
+          O2: [O2, O2-M1, O2-A1]
+      eog:
+        canonical_channels: [LOC, ROC]
+        alias_groups:
+          LOC: [LOC, LEFTEOG, E1, E1-FPZ, LOC-A2, LEFTEOGM2REF, HORIZONTALEOG]
+          ROC: [ROC, RIGHTEOG, E2, E2-FPZ, ROC-A1]
+      emg:
+        canonical_channels: [CHIN, LEG]
+        alias_groups:
+          CHIN: [CHINEMG, EMGCHIN, SUBMENTALEMG, EMG]
+          LEG: [LEGEMG, TIBIALEMG]
+      ecg:
+        canonical_channels: [ECG]
+        alias_groups:
+          ECG: [ECG, EKG]
+      airflow:
+        canonical_channels: [AIRFLOW]
+        alias_groups:
+          AIRFLOW: [AIRFLOW, NASALPRESSURE]
+      thoracoabdominal:
+        canonical_channels: [THORAX, ABDOMEN]
+        alias_groups:
+          THORAX: [THORAX, CHEST, RESPTHORAX]
+          ABDOMEN: [ABDOMEN, ABD, RESPABDOMEN]
+      spo2:
+        canonical_channels: [SPO2]
+        alias_groups:
+          SPO2: [SPO2, SAO2]
+      ppg:
+        canonical_channels: [PPG]
+        alias_groups:
+          PPG: [PPG, PLETH]
+
+model:
+  num_classes: 5
+  d_model: 256
+  dropout: 0.1
+  transformer:
+    nhead: 8
+    num_layers: 2
+    dim_feedforward: 512
+  reference_embedding:
+    enabled: true
+    num_references: 16
+  modalities:
+    eeg:
+      in_channels: 6
+      sample_rate: 100
+      channel_last: false
+      encoder:
+        hidden_channels: 128
+        kernel_size: 7
+        stride: 2
+    eog:
+      in_channels: 2
+      sample_rate: 100
+      channel_last: false
+      encoder:
+        hidden_channels: 64
+        kernel_size: 7
+        stride: 2
+    emg:
+      in_channels: 2
+      sample_rate: 100
+      channel_last: false
+      encoder:
+        hidden_channels: 64
+        kernel_size: 7
+        stride: 2
+    ecg:
+      in_channels: 1
+      sample_rate: 100
+      channel_last: false
+      encoder:
+        hidden_channels: 64
+        kernel_size: 7
+        stride: 2
+    airflow:
+      in_channels: 1
+      sample_rate: 10
+      channel_last: false
+      encoder:
+        hidden_channels: 32
+        kernel_size: 5
+        stride: 2
+    thoracoabdominal:
+      in_channels: 2
+      sample_rate: 10
+      channel_last: false
+      encoder:
+        hidden_channels: 32
+        kernel_size: 5
+        stride: 2
+    spo2:
+      in_channels: 1
+      sample_rate: 10
+      channel_last: false
+      encoder:
+        hidden_channels: 32
+        kernel_size: 5
+        stride: 2
+    ppg:
+      in_channels: 1
+      sample_rate: 10
+      channel_last: false
+      encoder:
+        hidden_channels: 32
+        kernel_size: 5
+        stride: 2
+
+training:
+  epochs: 100
+  grad_accum_steps: 1
+  max_grad_norm: 1.0
+  use_amp: true
+  find_unused_parameters: false
+  deterministic: false
+  use_torch_compile: false
+  log_interval: 20
+  val_interval: 1
+  save_interval: 1
+  optimizer:
+    name: adamw
+    lr: 3.0e-4
+    weight_decay: 1.0e-2
+    betas: [0.9, 0.999]
+  scheduler:
+    name: cosine
+    warmup_epochs: 5
+    min_lr: 1.0e-6
+  class_weights: []
+  disable_reference_embedding: false
+  # Training-time view dropout (part of main training recipe, not ablation).
+  view_dropout:
+    enabled: false
+    force_drop_modalities: []
+    random_modality_drop_prob: 0.0
+    random_channel_drop_prob: 0.0
+
+finetune:
+  pretrained_checkpoint: ""
+  resume_checkpoint: ""
+  freeze_backbone_epochs: 0
+  lr_scale_backbone: 0.3
+
