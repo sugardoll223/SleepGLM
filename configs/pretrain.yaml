@@ -17,7 +17,6 @@ data:
 
 training:
   epochs: 80
-  disable_reference_embedding: false
   view_dropout:
     enabled: true
     force_drop_modalities: []

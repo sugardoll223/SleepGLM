@@ -18,7 +18,6 @@ data:
 training:
   # One-night sequence target length: 12h = 1440 epochs (30s per epoch).
   epochs: 1440
-  disable_reference_embedding: false
   view_dropout:
     enabled: false
     force_drop_modalities: []

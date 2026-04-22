@@ -13,15 +13,15 @@ wandb/
 
 .DS_Store
 Thumbs.db
+*.baiduyun.uploading.cfg
 
 # datasets / large data artifacts
-dset/
-data/
-dataset/
-datasets/
-raw_data/
-processed_data/
-*_data/
+/data/
+/dataset/
+/datasets/
+/raw_data/
+/processed_data/
+/*_data/
 *.npy
 *.npz
 *.h5

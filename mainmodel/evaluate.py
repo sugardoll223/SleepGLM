@@ -9,7 +9,7 @@ from mainmodel.utils import load_config
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Model evaluation entrypoint.")
     parser.add_argument("--config", type=str, required=True, help="Path to yaml config.")
-    parser.add_argument("--checkpoint", type=str, required=False, default="", help="Optional checkpoint path.")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path for evaluation.")
     parser.add_argument(
         "--override",
         type=str,

@@ -15,6 +15,10 @@ class Model(nn.Module):
         self.num_classes = int(model_cfg["num_classes"])
         self.d_model = int(model_cfg["d_model"])
         self.dropout = float(model_cfg.get("dropout", 0.1))
+        self.task_aliases = {
+            "staging": "sleep_staging",
+            "sleep_stage_classification": "sleep_staging",
+        }
 
         modalities_cfg = model_cfg.get("modalities", {})
         self.modality_names = list(modalities_cfg.keys())
@@ -37,17 +41,6 @@ class Model(nn.Module):
                 d_state=int(enc_cfg.get("d_state", 64)),
             )
 
-        self.modality_embedding = nn.Embedding(len(self.modality_names), self.d_model)
-
-        reference_cfg = model_cfg.get("reference_embedding", {})
-        self.reference_enabled = bool(reference_cfg.get("enabled", True))
-        self.num_references = int(reference_cfg.get("num_references", 16))
-        self.reference_embedding = (
-            nn.Embedding(self.num_references, self.d_model)
-            if self.reference_enabled
-            else None
-        )
-
         tf_cfg = model_cfg.get("transformer", {})
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
@@ -62,10 +55,132 @@ class Model(nn.Module):
             num_layers=int(tf_cfg.get("num_layers", 2)),
         )
         self.norm = nn.LayerNorm(self.d_model)
-        self.classifier = nn.Sequential(
-            nn.Dropout(self.dropout),
-            nn.Linear(self.d_model, self.num_classes),
+
+        fusion_cfg = model_cfg.get("fusion", {})
+        rope_dim = int(fusion_cfg.get("rope_dim", self.d_model))
+        rope_dim = min(self.d_model, max(0, rope_dim))
+        if rope_dim % 2 != 0:
+            rope_dim -= 1
+        self.use_rope = bool(fusion_cfg.get("use_rope", True)) and rope_dim >= 2
+        self.rope_dim = rope_dim
+        if self.use_rope:
+            inv_freq = 1.0 / (
+                10000
+                ** (
+                    torch.arange(0, self.rope_dim, 2, dtype=torch.float32)
+                    / float(self.rope_dim)
+                )
+            )
+            self.register_buffer("rope_inv_freq", inv_freq, persistent=False)
+        else:
+            self.register_buffer("rope_inv_freq", torch.empty(0), persistent=False)
+
+        self.use_pairwise_interaction = bool(fusion_cfg.get("use_pairwise_interaction", True))
+        self.interaction_scale = self.d_model ** -0.5
+        self.interaction_q = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.interaction_k = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.interaction_v = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.interaction_out = nn.Linear(self.d_model, self.d_model, bias=False)
+        temporal_cfg = model_cfg.get("temporal", {})
+        self.use_temporal_context = bool(temporal_cfg.get("enabled", True))
+        temporal_layers = int(temporal_cfg.get("num_layers", 2))
+        if self.use_temporal_context and temporal_layers > 0:
+            temporal_layer = nn.TransformerEncoderLayer(
+                d_model=self.d_model,
+                nhead=int(temporal_cfg.get("nhead", tf_cfg.get("nhead", 8))),
+                dim_feedforward=int(temporal_cfg.get("dim_feedforward", 4 * self.d_model)),
+                dropout=self.dropout,
+                batch_first=True,
+                norm_first=True,
+            )
+            self.temporal_encoder = nn.TransformerEncoder(
+                encoder_layer=temporal_layer,
+                num_layers=temporal_layers,
+            )
+        else:
+            self.temporal_encoder = None
+        self.temporal_norm = nn.LayerNorm(self.d_model)
+
+        self.task_heads = nn.ModuleDict()
+        task_cfg = model_cfg.get("downstream_tasks", {})
+        if isinstance(task_cfg, dict):
+            for task_name, head_cfg_raw in task_cfg.items():
+                if not isinstance(head_cfg_raw, dict):
+                    head_cfg_raw = {}
+                normalized = self._normalize_task_name(str(task_name))
+                if normalized in self.task_heads:
+                    continue
+                out_dim = int(head_cfg_raw.get("num_classes", self.num_classes))
+                head_dropout = float(head_cfg_raw.get("dropout", self.dropout))
+                self.task_heads[normalized] = nn.Sequential(
+                    nn.Dropout(head_dropout),
+                    nn.Linear(self.d_model, out_dim),
+                )
+
+        if "sleep_staging" not in self.task_heads:
+            self.task_heads["sleep_staging"] = nn.Sequential(
+                nn.Dropout(self.dropout),
+                nn.Linear(self.d_model, self.num_classes),
+            )
+        # Backward-compat alias used by some older code paths.
+        self.classifier = self.task_heads["sleep_staging"]
+
+    def _normalize_task_name(self, task_name: str | None) -> str:
+        if task_name is None:
+            return "sleep_staging"
+        normalized = str(task_name).strip().lower()
+        if normalized == "":
+            return "sleep_staging"
+        return self.task_aliases.get(normalized, normalized)
+
+    def get_supported_tasks(self) -> list[str]:
+        return sorted(list(self.task_heads.keys()))
+
+    def get_task_head(self, task_name: str | None) -> tuple[nn.Module, str]:
+        normalized = self._normalize_task_name(task_name)
+        if normalized not in self.task_heads:
+            raise KeyError(
+                f"Unknown downstream task '{task_name}'. "
+                f"Supported tasks: {self.get_supported_tasks()}"
+            )
+        return self.task_heads[normalized], normalized
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+    def _build_rope_cos_sin(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = torch.arange(seq_len, device=device, dtype=self.rope_inv_freq.dtype)
+        freqs = torch.einsum("l,d->ld", pos, self.rope_inv_freq.to(device=device))
+        cos = freqs.cos().to(dtype=dtype)
+        sin = freqs.sin().to(dtype=dtype)
+        cos = torch.repeat_interleave(cos, repeats=2, dim=-1).unsqueeze(0)
+        sin = torch.repeat_interleave(sin, repeats=2, dim=-1).unsqueeze(0)
+        return cos, sin
+
+    def _apply_rope(self, tokens: torch.Tensor) -> torch.Tensor:
+        if not self.use_rope:
+            return tokens
+        if tokens.shape[-1] < self.rope_dim or self.rope_dim < 2:
+            return tokens
+        rope_part = tokens[..., : self.rope_dim]
+        rest = tokens[..., self.rope_dim :]
+        cos, sin = self._build_rope_cos_sin(
+            seq_len=tokens.shape[1],
+            device=tokens.device,
+            dtype=tokens.dtype,
         )
+        rope_part = rope_part * cos + self._rotate_half(rope_part) * sin
+        if rest.numel() == 0:
+            return rope_part
+        return torch.cat([rope_part, rest], dim=-1)
 
     def encode_modalities(self, modalities: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         encoded: dict[str, torch.Tensor] = {}
@@ -77,33 +192,58 @@ class Model(nn.Module):
         self,
         encoded: dict[str, torch.Tensor],
         modality_mask: dict[str, torch.Tensor],
-        reference_ids: torch.Tensor | None,
-        disable_reference_embedding: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        channel_mask: dict[str, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         token_list = []
         mask_list = []
-        for mod_idx, mod_name in enumerate(self.modality_names):
+        for mod_name in self.modality_names:
             feat = encoded[mod_name]
-            feat = feat + self.modality_embedding.weight[mod_idx].unsqueeze(0)
             token_list.append(feat)
-            mask_list.append(modality_mask[mod_name].to(dtype=torch.bool, device=feat.device))
+            present = modality_mask[mod_name].to(dtype=torch.bool, device=feat.device)
+            if channel_mask is not None and mod_name in channel_mask:
+                ch_present = channel_mask[mod_name].to(device=feat.device)
+                if ch_present.ndim >= 2:
+                    ch_present = ch_present.any(dim=1)
+                ch_present = ch_present.to(dtype=torch.bool, device=feat.device)
+                present = present & ch_present
+            mask_list.append(present)
 
         tokens = torch.stack(token_list, dim=1)
         present_mask = torch.stack(mask_list, dim=1)
         padding_mask = ~present_mask
 
-        if self.reference_embedding is not None and not disable_reference_embedding and reference_ids is not None:
-            ref = reference_ids.clamp(min=0, max=self.num_references - 1)
-            ref_embed = self.reference_embedding(ref)
-            tokens = tokens + ref_embed.unsqueeze(1)
+        tokens = self._apply_rope(tokens)
 
         all_missing = padding_mask.all(dim=1)
         if all_missing.any():
             padding_mask = padding_mask.clone()
             padding_mask[all_missing, 0] = False
-        return tokens, padding_mask
+        return tokens, padding_mask, present_mask
 
-    def fuse_tokens(self, tokens: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
+    def _apply_pairwise_interaction(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.use_pairwise_interaction:
+            return tokens
+        valid = ~padding_mask
+        q = self.interaction_q(tokens)
+        k = self.interaction_k(tokens)
+        v = self.interaction_v(tokens)
+        logits = torch.matmul(q, k.transpose(1, 2)) * self.interaction_scale
+        logits = logits.masked_fill(~valid.unsqueeze(1), -1e4)
+        weights = torch.softmax(logits, dim=-1)
+        interacted = torch.matmul(weights, v)
+        interacted = self.interaction_out(interacted)
+        return tokens + interacted * valid.unsqueeze(-1).to(dtype=tokens.dtype)
+
+    def fuse_tokens(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens = self._apply_pairwise_interaction(tokens=tokens, padding_mask=padding_mask)
         fused = self.fusion(tokens, src_key_padding_mask=padding_mask)
         valid = (~padding_mask).float()
         pooled = (fused * valid.unsqueeze(-1)).sum(dim=1) / valid.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -114,29 +254,100 @@ class Model(nn.Module):
         self,
         modalities: dict[str, torch.Tensor],
         modality_mask: dict[str, torch.Tensor],
-        reference_ids: torch.Tensor | None = None,
-        disable_reference_embedding: bool = False,
+        channel_mask: dict[str, torch.Tensor] | None = None,
+        seq_padding_mask: torch.Tensor | None = None,
+        task_name: str = "sleep_staging",
         return_features: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        encoded = self.encode_modalities(modalities)
-        tokens, padding_mask = self._build_tokens_and_padding_mask(
+        first_modality = next(iter(self.modality_names))
+        x0 = modalities[first_modality]
+        is_sequence = x0.ndim == 4
+
+        if not is_sequence:
+            encoded = self.encode_modalities(modalities)
+            tokens, padding_mask, _ = self._build_tokens_and_padding_mask(
+                encoded=encoded,
+                modality_mask=modality_mask,
+                channel_mask=channel_mask,
+            )
+            pooled = self.fuse_tokens(tokens=tokens, padding_mask=padding_mask)
+            head, _ = self.get_task_head(task_name)
+            logits = head(pooled)
+            if return_features:
+                return logits, pooled
+            return logits
+
+        batch_size, seq_len = x0.shape[0], x0.shape[1]
+        flat_modalities: dict[str, torch.Tensor] = {}
+        flat_modality_mask: dict[str, torch.Tensor] = {}
+        flat_channel_mask: dict[str, torch.Tensor] | None = {} if channel_mask is not None else None
+        for mod_name in self.modality_names:
+            x_mod = modalities[mod_name]
+            if x_mod.ndim != 4:
+                raise ValueError(
+                    f"Sequence mode expects modality tensor [B, L, C, T], got {tuple(x_mod.shape)} for {mod_name}"
+                )
+            flat_modalities[mod_name] = x_mod.reshape(batch_size * seq_len, x_mod.shape[2], x_mod.shape[3])
+            m_mod = modality_mask[mod_name]
+            if m_mod.ndim != 2:
+                raise ValueError(
+                    f"Sequence mode expects modality mask [B, L], got {tuple(m_mod.shape)} for {mod_name}"
+                )
+            flat_modality_mask[mod_name] = m_mod.reshape(batch_size * seq_len)
+
+            if flat_channel_mask is not None and channel_mask is not None and mod_name in channel_mask:
+                c_mod = channel_mask[mod_name]
+                if c_mod.ndim != 3:
+                    raise ValueError(
+                        f"Sequence mode expects channel mask [B, L, C], got {tuple(c_mod.shape)} for {mod_name}"
+                    )
+                flat_channel_mask[mod_name] = c_mod.reshape(batch_size * seq_len, c_mod.shape[2])
+
+        encoded = self.encode_modalities(flat_modalities)
+        tokens, padding_mask, _ = self._build_tokens_and_padding_mask(
             encoded=encoded,
-            modality_mask=modality_mask,
-            reference_ids=reference_ids,
-            disable_reference_embedding=disable_reference_embedding,
+            modality_mask=flat_modality_mask,
+            channel_mask=flat_channel_mask,
         )
-        pooled = self.fuse_tokens(tokens=tokens, padding_mask=padding_mask)
-        logits = self.classifier(pooled)
+        pooled_flat = self.fuse_tokens(tokens=tokens, padding_mask=padding_mask)
+        features = pooled_flat.reshape(batch_size, seq_len, self.d_model)
+
+        if seq_padding_mask is None:
+            valid_t = None
+            for mod_name in self.modality_names:
+                m = modality_mask[mod_name].to(dtype=torch.bool, device=features.device)
+                valid_t = m if valid_t is None else (valid_t | m)
+            seq_padding_mask = ~valid_t
+        else:
+            seq_padding_mask = seq_padding_mask.to(dtype=torch.bool, device=features.device)
+
+        if self.temporal_encoder is not None:
+            features = self.temporal_encoder(features, src_key_padding_mask=seq_padding_mask)
+        features = self.temporal_norm(features)
+
+        head, _ = self.get_task_head(task_name)
+        logits = head(features)
         if return_features:
-            return logits, pooled
+            return logits, features
         return logits
 
     def freeze_backbone(self, freeze: bool = True) -> None:
-        modules = [self.encoders, self.modality_embedding, self.fusion, self.norm, self.reference_embedding]
+        modules = [
+            self.encoders,
+            self.fusion,
+            self.norm,
+            self.interaction_q,
+            self.interaction_k,
+            self.interaction_v,
+            self.interaction_out,
+            self.temporal_encoder,
+            self.temporal_norm,
+        ]
         for module in modules:
             if module is None:
                 continue
             for p in module.parameters():
                 p.requires_grad = not freeze
-        for p in self.classifier.parameters():
-            p.requires_grad = True
+        for head in self.task_heads.values():
+            for p in head.parameters():
+                p.requires_grad = True

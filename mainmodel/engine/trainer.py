@@ -33,6 +33,12 @@ def _is_finetune_stage(stage: str) -> bool:
     return normalized in {"finetune", "stage3_finetune", "stage3_downstream_finetune", "stage3"}
 
 
+def _normalize_task_name(task: str | None) -> str:
+    if task is None:
+        return "sleep_staging"
+    return str(task).strip().lower()
+
+
 def build_optimizer(cfg: dict[str, Any], model: nn.Module) -> torch.optim.Optimizer:
     training_cfg = cfg["training"]
     optimizer_cfg = training_cfg.get("optimizer", {})
@@ -49,7 +55,7 @@ def build_optimizer(cfg: dict[str, Any], model: nn.Module) -> torch.optim.Optimi
     for name, p in core_model.named_parameters():
         if not p.requires_grad:
             continue
-        if name.startswith("classifier"):
+        if name.startswith("classifier") or name.startswith("task_heads"):
             head_params.append(p)
         else:
             backbone_params.append(p)
@@ -128,21 +134,26 @@ class DDPTrainer:
 
         self.stage = _normalize_stage(cfg.get("experiment", {}).get("stage", "stage2_multimodal_pretrain"))
         self.training_cfg = cfg["training"]
+        self.downstream_task = _normalize_task_name(self.training_cfg.get("downstream_task", "sleep_staging"))
+        self.downstream_task_alias = {
+            "staging": "sleep_staging",
+            "sleep_stage_classification": "sleep_staging",
+        }
         self.stage1_cfg = self.training_cfg.get("stage1_eeg_jepa", {})
         self.stage2_cfg = self.training_cfg.get("stage2_multimodal", {})
 
         self.view_dropout_cfg = self.training_cfg.get("view_dropout", {})
 
-        self.disable_reference_embedding = bool(self.training_cfg.get("disable_reference_embedding", False))
-        self.num_classes = int(cfg["model"]["num_classes"])
+        self.num_classes = self._resolve_num_classes(cfg["model"])
         self.global_step = 0
+        self.sequence_label_pad_value = int(cfg.get("data", {}).get("sequence_label_pad_value", -100))
 
         class_weights = self.training_cfg.get("class_weights", [])
         if class_weights:
             weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
-            self.criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+            self.criterion = nn.CrossEntropyLoss(weight=weight_tensor, ignore_index=self.sequence_label_pad_value)
         else:
-            self.criterion = nn.CrossEntropyLoss()
+            self.criterion = nn.CrossEntropyLoss(ignore_index=self.sequence_label_pad_value)
 
         self.stage1_eeg_groups = self._resolve_stage1_eeg_groups()
         self.stage1_single_channel_indices = self._resolve_stage1_single_channel_indices()
@@ -157,6 +168,23 @@ class DDPTrainer:
         self.stage2_lambda = float(self.stage2_cfg.get("lamb", self.stage2_cfg.get("lambda_sigreg", 0.05)))
         self.stage2_lambda = min(1.0, max(0.0, self.stage2_lambda))
         self.stage2_sigreg_cfg = self.stage2_cfg.get("sigreg", {})
+
+    def _normalized_downstream_task(self) -> str:
+        normalized = _normalize_task_name(self.downstream_task)
+        return self.downstream_task_alias.get(normalized, normalized)
+
+    def _resolve_num_classes(self, model_cfg: dict[str, Any]) -> int:
+        default = int(model_cfg.get("num_classes", 2))
+        task_cfg = model_cfg.get("downstream_tasks", {})
+        if not isinstance(task_cfg, dict):
+            return default
+        task_name = self._normalized_downstream_task()
+        if task_name not in task_cfg:
+            return default
+        task_head_cfg = task_cfg.get(task_name, {})
+        if not isinstance(task_head_cfg, dict):
+            return default
+        return int(task_head_cfg.get("num_classes", default))
 
     def _resolve_stage1_eeg_groups(self) -> dict[str, list[int]]:
         core_model = _unwrap_model(self.model)
@@ -282,20 +310,26 @@ class DDPTrainer:
         self,
         batch: dict[str, Any],
         keep_modalities: set[str],
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         modalities_view: dict[str, torch.Tensor] = {}
         mask_view: dict[str, torch.Tensor] = {}
+        channel_view: dict[str, torch.Tensor] = {}
         core_model = _unwrap_model(self.model)
         for mod_name in core_model.modality_names:
             x = batch["modalities"][mod_name]
             m = batch["modality_mask"][mod_name]
+            c = batch.get("channel_mask", {}).get(mod_name)
             if mod_name in keep_modalities:
                 modalities_view[mod_name] = x
                 mask_view[mod_name] = m
+                if c is not None:
+                    channel_view[mod_name] = c
             else:
                 modalities_view[mod_name] = torch.zeros_like(x)
                 mask_view[mod_name] = torch.zeros_like(m)
-        return modalities_view, mask_view
+                if c is not None:
+                    channel_view[mod_name] = torch.zeros_like(c)
+        return modalities_view, mask_view, channel_view
 
     def _build_stage2_keep_sets(self) -> list[set[str]]:
         core_model = _unwrap_model(self.model)
@@ -337,8 +371,11 @@ class DDPTrainer:
         if "channel_mask" in batch:
             for key in batch["channel_mask"]:
                 batch["channel_mask"][key] = batch["channel_mask"][key].to(self.device, non_blocking=True)
+        if "seq_padding_mask" in batch:
+            batch["seq_padding_mask"] = batch["seq_padding_mask"].to(self.device, non_blocking=True)
+        if "seq_lengths" in batch:
+            batch["seq_lengths"] = batch["seq_lengths"].to(self.device, non_blocking=True)
         batch["labels"] = batch["labels"].to(self.device, non_blocking=True)
-        batch["reference_ids"] = batch["reference_ids"].to(self.device, non_blocking=True)
         batch["dataset_ids"] = batch["dataset_ids"].to(self.device, non_blocking=True)
         return batch
 
@@ -372,19 +409,39 @@ class DDPTrainer:
                         c_mask[drop] = False
 
             if channel_drop_prob > 0:
-                present_indices = torch.where(mask)[0]
-                if present_indices.numel() > 0:
-                    rand_mask = torch.rand((present_indices.numel(), x.shape[1]), device=x.device) < channel_drop_prob
-                    for local_idx, batch_idx in enumerate(present_indices):
-                        if c_mask is None:
-                            valid_channels = torch.ones(x.shape[1], dtype=torch.bool, device=x.device)
-                        else:
-                            valid_channels = c_mask[batch_idx].to(device=x.device)
-                        drop_channels = rand_mask[local_idx] & valid_channels
-                        if drop_channels.any():
-                            x[batch_idx, drop_channels, :] = 0.0
-                            if c_mask is not None:
-                                c_mask[batch_idx, drop_channels] = False
+                if mask.ndim == 1:
+                    present_indices = torch.where(mask)[0]
+                    if present_indices.numel() > 0:
+                        rand_mask = torch.rand((present_indices.numel(), x.shape[1]), device=x.device) < channel_drop_prob
+                        for local_idx, batch_idx in enumerate(present_indices):
+                            if c_mask is None:
+                                valid_channels = torch.ones(x.shape[1], dtype=torch.bool, device=x.device)
+                            else:
+                                valid_channels = c_mask[batch_idx].to(device=x.device)
+                            drop_channels = rand_mask[local_idx] & valid_channels
+                            if drop_channels.any():
+                                x[batch_idx, drop_channels, :] = 0.0
+                                if c_mask is not None:
+                                    c_mask[batch_idx, drop_channels] = False
+                elif mask.ndim == 2:
+                    present_positions = torch.nonzero(mask, as_tuple=False)
+                    if present_positions.numel() > 0:
+                        rand_mask = (
+                            torch.rand((present_positions.shape[0], x.shape[2]), device=x.device)
+                            < channel_drop_prob
+                        )
+                        for local_idx, pos in enumerate(present_positions):
+                            b_idx = int(pos[0].item())
+                            t_idx = int(pos[1].item())
+                            if c_mask is None:
+                                valid_channels = torch.ones(x.shape[2], dtype=torch.bool, device=x.device)
+                            else:
+                                valid_channels = c_mask[b_idx, t_idx].to(device=x.device)
+                            drop_channels = rand_mask[local_idx] & valid_channels
+                            if drop_channels.any():
+                                x[b_idx, t_idx, drop_channels, :] = 0.0
+                                if c_mask is not None:
+                                    c_mask[b_idx, t_idx, drop_channels] = False
 
     def _sigreg(self, proj: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
         x = proj.float()
@@ -470,14 +527,12 @@ class DDPTrainer:
         self,
         modalities: dict[str, torch.Tensor],
         modality_mask: dict[str, torch.Tensor],
-        reference_ids: torch.Tensor,
-        disable_ref: bool,
+        channel_mask: dict[str, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         _, feat = self.model(
             modalities=modalities,
             modality_mask=modality_mask,
-            reference_ids=reference_ids,
-            disable_reference_embedding=disable_ref,
+            channel_mask=channel_mask,
             return_features=True,
         )
         return feat
@@ -485,7 +540,6 @@ class DDPTrainer:
     def _compute_stage2_multimodal_pretrain_loss(
         self,
         batch: dict[str, Any],
-        disable_ref: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
         global_embs = []
         for _ in range(self.stage2_num_global_views):
@@ -493,20 +547,21 @@ class DDPTrainer:
                 self._extract_fused_feature(
                     modalities=batch["modalities"],
                     modality_mask=batch["modality_mask"],
-                    reference_ids=batch["reference_ids"],
-                    disable_ref=disable_ref,
+                    channel_mask=batch.get("channel_mask"),
                 )
             )
 
         all_embs = list(global_embs)
         for keep_set in self._build_stage2_keep_sets():
-            modalities_view, mask_view = self._build_stage2_view(batch=batch, keep_modalities=keep_set)
+            modalities_view, mask_view, channel_view = self._build_stage2_view(
+                batch=batch,
+                keep_modalities=keep_set,
+            )
             all_embs.append(
                 self._extract_fused_feature(
                     modalities=modalities_view,
                     modality_mask=mask_view,
-                    reference_ids=batch["reference_ids"],
-                    disable_ref=disable_ref,
+                    channel_mask=channel_view,
                 )
             )
 
@@ -526,28 +581,46 @@ class DDPTrainer:
     def _compute_supervised_ce_loss(
         self,
         batch: dict[str, Any],
-        disable_ref: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
-        logits = self.model(
-            modalities=batch["modalities"],
-            modality_mask=batch["modality_mask"],
-            reference_ids=batch["reference_ids"],
-            disable_reference_embedding=disable_ref,
-        )
-        loss = self.criterion(logits, batch["labels"])
+        try:
+            logits = self.model(
+                modalities=batch["modalities"],
+                modality_mask=batch["modality_mask"],
+                channel_mask=batch.get("channel_mask"),
+                seq_padding_mask=batch.get("seq_padding_mask"),
+                task_name=self.downstream_task,
+            )
+        except KeyError as exc:
+            core_model = _unwrap_model(self.model)
+            supported = []
+            if hasattr(core_model, "get_supported_tasks"):
+                try:
+                    supported = list(core_model.get_supported_tasks())
+                except Exception:
+                    supported = []
+            raise NotImplementedError(
+                f"Unsupported downstream task '{self.downstream_task}'. "
+                f"Supported tasks: {supported}"
+            ) from exc
+        if logits.ndim == 3 and batch["labels"].ndim == 2:
+            loss = self.criterion(
+                logits.reshape(-1, logits.shape[-1]),
+                batch["labels"].reshape(-1),
+            )
+        else:
+            loss = self.criterion(logits, batch["labels"])
         aux = {"ce_loss": loss.detach()}
         return loss, logits, aux
 
     def _compute_objective(
         self,
         batch: dict[str, Any],
-        disable_ref: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
         if _is_stage1_eeg_jepa(self.stage):
             return self._compute_stage1_eeg_jepa_loss(batch=batch)
         if _is_stage2_multimodal_pretrain(self.stage):
-            return self._compute_stage2_multimodal_pretrain_loss(batch=batch, disable_ref=disable_ref)
-        return self._compute_supervised_ce_loss(batch=batch, disable_ref=disable_ref)
+            return self._compute_stage2_multimodal_pretrain_loss(batch=batch)
+        return self._compute_supervised_ce_loss(batch=batch)
 
     def _sync_loss_and_count(self, loss_sum: torch.Tensor, sample_count: torch.Tensor) -> tuple[float, int]:
         if dist.is_available() and dist.is_initialized():
@@ -587,7 +660,6 @@ class DDPTrainer:
         log_interval = int(self.training_cfg.get("log_interval", 20))
         max_grad_norm = float(self.training_cfg.get("max_grad_norm", 1.0))
         use_amp = bool(self.training_cfg.get("use_amp", True)) and self.device.type == "cuda"
-        disable_ref = self.disable_reference_embedding
 
         loss_sum = torch.zeros(1, device=self.device, dtype=torch.float64)
         sample_count = torch.zeros(1, device=self.device, dtype=torch.float64)
@@ -603,7 +675,7 @@ class DDPTrainer:
             self._apply_view_dropout(batch, training=training)
 
             with torch.autocast(device_type=self.device.type, enabled=use_amp):
-                loss, logits_for_metrics, aux = self._compute_objective(batch=batch, disable_ref=disable_ref)
+                loss, logits_for_metrics, aux = self._compute_objective(batch=batch)
 
             if training:
                 scaled_loss = loss / max(1, grad_accum_steps)
@@ -630,10 +702,28 @@ class DDPTrainer:
                     self.global_step += 1
 
             if logits_for_metrics is not None:
-                preds = torch.argmax(logits_for_metrics, dim=1)
-                confusion = update_confusion(confusion, preds=preds, targets=batch["labels"], num_classes=self.num_classes)
+                if logits_for_metrics.ndim == 3 and batch["labels"].ndim == 2:
+                    preds = torch.argmax(logits_for_metrics, dim=-1)
+                    targets = batch["labels"]
+                    if "seq_padding_mask" in batch:
+                        valid = ~batch["seq_padding_mask"]
+                    else:
+                        valid = targets != self.sequence_label_pad_value
+                    preds = preds[valid]
+                    targets = targets[valid]
+                else:
+                    preds = torch.argmax(logits_for_metrics, dim=1)
+                    targets = batch["labels"]
+                confusion = update_confusion(confusion, preds=preds, targets=targets, num_classes=self.num_classes)
 
-            bs = batch["labels"].shape[0]
+            if batch["labels"].ndim == 2:
+                if "seq_padding_mask" in batch:
+                    valid_tokens = (~batch["seq_padding_mask"]) & (batch["labels"] != self.sequence_label_pad_value)
+                    bs = int(valid_tokens.sum().item())
+                else:
+                    bs = int((batch["labels"] != self.sequence_label_pad_value).sum().item())
+            else:
+                bs = batch["labels"].shape[0]
             loss_sum += loss.detach().to(dtype=torch.float64) * bs
             sample_count += bs
             for key, value in aux.items():

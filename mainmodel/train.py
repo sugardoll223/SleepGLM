@@ -31,6 +31,11 @@ def _is_finetune_stage(stage: str) -> bool:
     return normalized in {"finetune", "stage3_finetune", "stage3_downstream_finetune"}
 
 
+def _is_stage2_pretrain_stage(stage: str) -> bool:
+    normalized = str(stage).strip().lower()
+    return normalized in {"pretrain", "stage2_multimodal_pretrain", "stage2"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Model training entrypoint (DDP-ready).")
     parser.add_argument("--config", type=str, required=True, help="Path to yaml config.")
@@ -60,6 +65,25 @@ def _maybe_sync_bn(cfg: dict[str, Any], model: torch.nn.Module, distributed: boo
 
 def _save_runtime_config(cfg: dict[str, Any], output_dir: str) -> None:
     dump_config(cfg, os.path.join(output_dir, "resolved_config.yaml"))
+
+
+def _resolve_eval_checkpoint(args_checkpoint: str, output_dir: str) -> str:
+    ckpt = args_checkpoint.strip()
+    if ckpt:
+        if not Path(ckpt).exists():
+            raise FileNotFoundError(f"Evaluation checkpoint not found: {ckpt}")
+        return ckpt
+
+    best_path = os.path.join(output_dir, "best.pt")
+    if os.path.exists(best_path):
+        return best_path
+    last_path = os.path.join(output_dir, "last.pt")
+    if os.path.exists(last_path):
+        return last_path
+    raise ValueError(
+        "Eval-only requires a checkpoint. Please pass --checkpoint, "
+        "or ensure outputs contain best.pt/last.pt."
+    )
 
 
 def _wrap_ddp(
@@ -99,6 +123,58 @@ def _load_pretrained_if_needed(
         ckpt_path,
         len(meta["missing_keys"]),
         len(meta["unexpected_keys"]),
+    )
+
+
+def _load_stage2_eeg_init_if_needed(
+    cfg: dict[str, Any],
+    model: torch.nn.Module,
+    logger: Any,
+) -> None:
+    stage = cfg.get("experiment", {}).get("stage", "stage2_multimodal_pretrain")
+    if not _is_stage2_pretrain_stage(stage):
+        return
+
+    stage2_cfg = cfg.get("training", {}).get("stage2_multimodal", {})
+    init_enabled = bool(stage2_cfg.get("init_eeg_encoder_from_stage1", False))
+    if not init_enabled:
+        logger.info("Stage2 EEG encoder initialization from stage1 is disabled.")
+        return
+
+    ckpt_path = str(stage2_cfg.get("stage1_checkpoint", "")).strip()
+    if not ckpt_path:
+        raise ValueError(
+            "training.stage2_multimodal.init_eeg_encoder_from_stage1=true "
+            "requires training.stage2_multimodal.stage1_checkpoint."
+        )
+    if not Path(ckpt_path).exists():
+        raise FileNotFoundError(f"stage1 checkpoint not found: {ckpt_path}")
+
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    source_state = checkpoint.get("model", checkpoint)
+
+    target_model = model.module if hasattr(model, "module") else model
+    target_state = target_model.state_dict()
+    loaded = 0
+    skipped = 0
+    for key, value in source_state.items():
+        if not key.startswith("encoders.eeg."):
+            continue
+        if key not in target_state:
+            skipped += 1
+            continue
+        if tuple(target_state[key].shape) != tuple(value.shape):
+            skipped += 1
+            continue
+        target_state[key] = value
+        loaded += 1
+
+    target_model.load_state_dict(target_state, strict=False)
+    logger.info(
+        "Stage2 EEG encoder initialized from %s | loaded=%d | skipped=%d",
+        ckpt_path,
+        loaded,
+        skipped,
     )
 
 
@@ -173,6 +249,7 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     model = _maybe_sync_bn(cfg, model, distributed=distributed)
     model = model.to(device)
 
+    _load_stage2_eeg_init_if_needed(cfg, model, logger)
     _load_pretrained_if_needed(cfg, model, logger)
 
     find_unused = bool(cfg.get("training", {}).get("find_unused_parameters", False))
@@ -209,12 +286,13 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     trainer.global_step = global_step
 
     if args.eval_only:
-        ckpt = args.checkpoint.strip()
-        if ckpt:
-            load_checkpoint(ckpt, model=model, strict=True, map_location="cpu")
-            if is_main_process():
-                logger.info("Loaded checkpoint for eval-only: %s", ckpt)
+        ckpt = _resolve_eval_checkpoint(args.checkpoint, output_dir=output_dir)
+        load_checkpoint(ckpt, model=model, strict=True, map_location="cpu")
+        if is_main_process():
+            logger.info("Loaded checkpoint for eval-only: %s", ckpt)
         target_loader = test_loader if test_loader is not None else val_loader
+        if target_loader is None:
+            raise ValueError("Eval-only requires data.val_files or data.test_files (or split_file).")
         metrics = trainer.evaluate(target_loader, epoch=start_epoch, split_name="eval")
         if is_main_process():
             logger.info("Eval metrics: %s", metrics)

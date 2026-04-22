@@ -6,24 +6,16 @@ experiment:
   output_dir: outputs/mainmodel_stage3_downstream_finetune
 
 data:
-  overnight_sequence:
-    enabled: true
-    target_epochs: 1440
-    # Short nights are padded to target length; long nights can be chunked.
-    pad_mode: zeros
-    split_long_recording:
-      enabled: true
-      chunk_epochs: 360
-      overlap_epochs: 30
+  # Use pre-generated split manifest.
+  split_file: configs/splits/sleepedf.json
+  split_root_dir: dset/Sleep-EDF
+  return_sequence: true
+  sequence_label_pad_value: -100
+  drop_last: false
 
 training:
   epochs: 1440
-  # Stage-3 recipe metadata (downstream overnight sleep staging).
-  stage3_downstream:
-    enabled: true
-    task: overnight_sleep_staging
-    target_epochs: 1440
-    freeze_backbone: true
+  downstream_task: sleep_staging
 
 finetune:
   freeze_backbone_epochs: 1440

@@ -19,9 +19,12 @@ data:
   continuous_label_key: hypnogram
 
   label_key_candidates: [label, labels, y]
-  reference_key_candidates: [reference_id, ref_id]
   dataset_id_key_candidates: [dataset_id]
   dataset_name_key_candidates: [dataset_name, dataset]
+  subject_id_key_candidates: [subject_id, subject, subject_name, patient_id, participant_id]
+  # Preferred split source: a manifest json containing files.train/val/test.
+  split_file: ""
+  split_root_dir: ""
 
   # Optional: map file name substring to dataset name for files without dataset_name fields.
   # Example: {"shhs": "SHHS", "sleepedf": "SLEEPEDF"}
@@ -65,12 +68,15 @@ data:
     ppg: [PPG, PLETH]
 
   epoch_seconds: 30
+  return_sequence: false
+  sequence_label_pad_value: -100
   num_workers: 4
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
   train_batch_size: 32
   val_batch_size: 32
+  test_batch_size: 32
   drop_last: true
   strict_modality: false
 
@@ -133,9 +139,19 @@ model:
     nhead: 8
     num_layers: 2
     dim_feedforward: 512
-  reference_embedding:
+  fusion:
+    use_rope: true
+    rope_dim: 256
+    use_pairwise_interaction: true
+  temporal:
     enabled: true
-    num_references: 16
+    nhead: 8
+    num_layers: 2
+    dim_feedforward: 512
+  downstream_tasks:
+    sleep_staging:
+      num_classes: 5
+      dropout: 0.1
   modalities:
     eeg:
       in_channels: 6
@@ -203,6 +219,7 @@ model:
         stride: 2
 
 training:
+  downstream_task: sleep_staging
   epochs: 100
   grad_accum_steps: 1
   max_grad_norm: 1.0
@@ -223,7 +240,6 @@ training:
     warmup_epochs: 5
     min_lr: 1.0e-6
   class_weights: []
-  disable_reference_embedding: false
   # Training-time view dropout (part of main training recipe, not ablation).
   view_dropout:
     enabled: false

@@ -9,6 +9,10 @@ training:
   # Stage-2 recipe metadata (for multi-view multimodal pretraining).
   stage2_multimodal:
     enabled: true
+    # Optional stage1 -> stage2 warm start for EEG encoder only.
+    # Keep false to train stage2 from scratch (no stage1 EEG initialization).
+    init_eeg_encoder_from_stage1: false
+    stage1_checkpoint: ""
     distill_temperature: 2.0
     loss_weights:
       ce_global: 1.0

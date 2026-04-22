@@ -84,6 +84,9 @@ def load_config(config_path: str, overrides: list[str] | None = None) -> dict[st
     cfg = _resolve_base_config(path, cfg)
     if overrides:
         cfg = _apply_overrides(cfg, overrides)
+    cfg.setdefault("_runtime", {})
+    cfg["_runtime"]["config_path"] = str(path)
+    cfg["_runtime"]["config_dir"] = str(path.parent)
     return cfg
 
 
@@ -92,4 +95,3 @@ def dump_config(cfg: dict[str, Any], out_path: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
-
