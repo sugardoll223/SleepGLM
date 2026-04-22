@@ -165,9 +165,14 @@ class DDPTrainer:
 
         self.stage2_num_missing_views = int(self.stage2_cfg.get("planned_missing_views", 6))
         self.stage2_num_global_views = max(1, int(self.stage2_cfg.get("num_global_views", len(self.stage2_cfg.get("global_views", ["all_modalities_present"])))))
+        self.stage2_local_views = self.stage2_cfg.get(
+            "local_views",
+            ["eeg_only", "eeg_plus_eog", "missing_any_one_or_two_modalities"],
+        )
         self.stage2_lambda = float(self.stage2_cfg.get("lamb", self.stage2_cfg.get("lambda_sigreg", 0.05)))
         self.stage2_lambda = min(1.0, max(0.0, self.stage2_lambda))
         self.stage2_sigreg_cfg = self.stage2_cfg.get("sigreg", {})
+        self._stage2_keep_sets_logged = False
 
     def _normalized_downstream_task(self) -> str:
         normalized = _normalize_task_name(self.downstream_task)
@@ -337,22 +342,68 @@ class DDPTrainer:
         if len(all_modalities) == 0:
             return []
 
-        keep_sets: list[set[str]] = []
-        if "eeg" in all_modalities:
-            keep_sets.append({"eeg"})
-        if "eeg" in all_modalities and "eog" in all_modalities:
-            keep_sets.append({"eeg", "eog"})
+        def _missing_any_one_or_two(num_views: int) -> list[set[str]]:
+            out: list[set[str]] = []
+            for i in range(max(0, num_views)):
+                drop_n = 1 if i % 2 == 0 else 2
+                max_drop = max(1, len(all_modalities) - 1)
+                drop_n = min(drop_n, max_drop)
+                perm = torch.randperm(len(all_modalities)).tolist()
+                drop_set = {all_modalities[j] for j in perm[:drop_n]}
+                keep = set(all_modalities) - drop_set
+                if len(keep) == 0:
+                    keep = {all_modalities[perm[-1]]}
+                out.append(keep)
+            return out
 
-        for i in range(max(0, self.stage2_num_missing_views)):
-            drop_n = 1 if i % 2 == 0 else 2
-            max_drop = max(1, len(all_modalities) - 1)
-            drop_n = min(drop_n, max_drop)
-            perm = torch.randperm(len(all_modalities)).tolist()
-            drop_set = {all_modalities[j] for j in perm[:drop_n]}
-            keep = set(all_modalities) - drop_set
-            if len(keep) == 0:
-                keep = {all_modalities[perm[-1]]}
-            keep_sets.append(keep)
+        def _keep_from_spec(spec: Any) -> list[set[str]]:
+            if isinstance(spec, dict):
+                if "keep" in spec:
+                    keep = {str(x).strip().lower() for x in spec.get("keep", [])}
+                    keep = {m for m in keep if m in all_modalities}
+                    return [keep] if len(keep) > 0 else []
+                if "drop" in spec:
+                    drop = {str(x).strip().lower() for x in spec.get("drop", [])}
+                    keep = set(all_modalities) - drop
+                    return [keep] if len(keep) > 0 else []
+                spec_type = str(spec.get("type", "")).strip().lower()
+                if spec_type == "missing_any_one_or_two_modalities":
+                    n = int(spec.get("num_views", self.stage2_num_missing_views))
+                    return _missing_any_one_or_two(n)
+                return []
+
+            text = str(spec).strip().lower()
+            if text == "":
+                return []
+            if text == "all_modalities_present":
+                return [set(all_modalities)]
+            if text == "eeg_only":
+                return [{"eeg"}] if "eeg" in all_modalities else []
+            if text in {"eeg_plus_eog", "eeg+eog"}:
+                keep = {m for m in ["eeg", "eog"] if m in all_modalities}
+                return [keep] if len(keep) > 0 else []
+            if text == "missing_any_one_or_two_modalities":
+                return _missing_any_one_or_two(self.stage2_num_missing_views)
+            if text.startswith("keep:"):
+                keep = {x.strip().lower() for x in text.replace("keep:", "", 1).split(",") if x.strip()}
+                keep = {m for m in keep if m in all_modalities}
+                return [keep] if len(keep) > 0 else []
+            if text.startswith("drop:"):
+                drop = {x.strip().lower() for x in text.replace("drop:", "", 1).split(",") if x.strip()}
+                keep = set(all_modalities) - drop
+                return [keep] if len(keep) > 0 else []
+            tokens = {x.strip().lower() for x in text.split(",") if x.strip()}
+            keep = {m for m in tokens if m in all_modalities}
+            return [keep] if len(keep) > 0 else []
+
+        keep_sets: list[set[str]] = []
+        specs = self.stage2_local_views
+        if not isinstance(specs, list):
+            specs = [specs]
+        for spec in specs:
+            keep_sets.extend(_keep_from_spec(spec))
+        if len(keep_sets) == 0:
+            keep_sets = [{"eeg"}] if "eeg" in all_modalities else [set(all_modalities)]
 
         dedup = []
         seen = set()
@@ -552,7 +603,13 @@ class DDPTrainer:
             )
 
         all_embs = list(global_embs)
-        for keep_set in self._build_stage2_keep_sets():
+        keep_sets = self._build_stage2_keep_sets()
+        if (not self._stage2_keep_sets_logged) and is_main_process():
+            pretty = [sorted(list(x)) for x in keep_sets]
+            self.logger.info("stage2 local keep sets (effective): %s", pretty)
+            self._stage2_keep_sets_logged = True
+
+        for keep_set in keep_sets:
             modalities_view, mask_view, channel_view = self._build_stage2_view(
                 batch=batch,
                 keep_modalities=keep_set,
