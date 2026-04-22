@@ -13,12 +13,8 @@ training:
     # Keep false to train stage2 from scratch (no stage1 EEG initialization).
     init_eeg_encoder_from_stage1: false
     stage1_checkpoint: ""
-    distill_temperature: 2.0
-    loss_weights:
-      ce_global: 1.0
-      feature_align: 1.0
-      kl_align: 1.0
-      ce_local: 0.0
+    # LeJEPA trade-off weight: total = (1-lamb)*pred_loss + lamb*sigreg_loss
+    lamb: 0.05
     global_views:
       - all_modalities_present
     local_views:

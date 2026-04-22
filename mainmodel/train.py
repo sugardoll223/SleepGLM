@@ -36,6 +36,21 @@ def _is_stage2_pretrain_stage(stage: str) -> bool:
     return normalized in {"pretrain", "stage2_multimodal_pretrain", "stage2"}
 
 
+def _resolve_metric_mode(metric_name: str, mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized in {"max", "min"}:
+        return normalized
+    if "loss" in str(metric_name).strip().lower():
+        return "min"
+    return "max"
+
+
+def _is_better_metric(current: float, best: float, mode: str, min_delta: float) -> bool:
+    if mode == "min":
+        return current < (best - min_delta)
+    return current > (best + min_delta)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Model training entrypoint (DDP-ready).")
     parser.add_argument("--config", type=str, required=True, help="Path to yaml config.")
@@ -306,6 +321,27 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     freeze_epochs = int(cfg.get("finetune", {}).get("freeze_backbone_epochs", 0))
     val_interval = int(cfg["training"].get("val_interval", 1))
     save_interval = int(cfg["training"].get("save_interval", 1))
+    early_cfg = cfg["training"].get("early_stopping", {})
+    early_enabled = bool(early_cfg.get("enabled", False))
+    early_metric_name = str(early_cfg.get("metric", "macro_f1")).strip() or "macro_f1"
+    early_mode = _resolve_metric_mode(early_metric_name, str(early_cfg.get("mode", "auto")))
+    early_patience = max(1, int(early_cfg.get("patience", 20)))
+    early_min_delta = float(early_cfg.get("min_delta", 0.0))
+    if early_mode == "min" and best_metric == float("-inf"):
+        best_metric = float("inf")
+    no_improve_epochs = 0
+    if early_enabled and val_loader is None and is_main_process():
+        logger.warning("early_stopping is enabled but no val_loader is available; disabling early stopping.")
+        early_enabled = False
+    if early_enabled and is_main_process():
+        logger.info(
+            "Early stopping enabled: metric=%s mode=%s patience=%d min_delta=%.6f",
+            early_metric_name,
+            early_mode,
+            early_patience,
+            early_min_delta,
+        )
+
     for epoch in range(start_epoch, epochs):
         if distributed and isinstance(train_loader.sampler, torch.utils.data.distributed.DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -322,7 +358,49 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         if val_loader is not None and ((epoch + 1) % max(1, val_interval) == 0):
             val_metrics = trainer.evaluate(val_loader, epoch=epoch, split_name="val")
 
+        current_val_metric = None
+        improved = False
+        if val_metrics is not None:
+            raw_metric = val_metrics.get(early_metric_name, None)
+            if raw_metric is not None:
+                current_val_metric = float(raw_metric)
+                improved = _is_better_metric(
+                    current=current_val_metric,
+                    best=best_metric,
+                    mode=early_mode,
+                    min_delta=early_min_delta,
+                )
+                if improved:
+                    best_metric = current_val_metric
+                    no_improve_epochs = 0
+                elif early_enabled:
+                    no_improve_epochs += 1
+            elif early_enabled and is_main_process():
+                logger.warning(
+                    "early_stopping metric '%s' not found in val metrics keys=%s; skip this epoch.",
+                    early_metric_name,
+                    sorted(list(val_metrics.keys())),
+                )
+
+        should_stop = bool(
+            early_enabled
+            and (val_metrics is not None)
+            and (current_val_metric is not None)
+            and (not improved)
+            and (no_improve_epochs >= early_patience)
+        )
+        if dist.is_available() and dist.is_initialized():
+            stop_tensor = torch.tensor(
+                1 if should_stop else 0,
+                device=device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+            should_stop = bool(int(stop_tensor.item()) > 0)
+
         if not is_main_process():
+            if should_stop:
+                break
             continue
 
         state = {
@@ -342,13 +420,23 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
             save_checkpoint(state, output_dir=output_dir, filename=f"last_epoch_{epoch:04d}.pt")
             save_checkpoint(state, output_dir=output_dir, filename="last.pt")
 
-        if val_metrics is not None:
-            metric = float(val_metrics.get("macro_f1", float("-inf")))
-            if metric > best_metric:
-                best_metric = metric
+        if val_metrics is not None and improved:
+            if current_val_metric is not None:
                 state["best_metric"] = best_metric
                 save_checkpoint(state, output_dir=output_dir, filename="best.pt")
-                logger.info("Best checkpoint updated at epoch %d with macro_f1=%.6f", epoch, best_metric)
+                logger.info(
+                    "Best checkpoint updated at epoch %d with %s=%.6f",
+                    epoch,
+                    early_metric_name,
+                    best_metric,
+                )
+        if should_stop:
+            logger.info(
+                "Early stopping triggered at epoch %d after %d non-improving val checks.",
+                epoch,
+                no_improve_epochs,
+            )
+            break
 
     if test_loader is not None:
         if is_main_process():

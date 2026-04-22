@@ -93,10 +93,18 @@ def build_scheduler(
     epochs = int(training_cfg.get("epochs", 1))
     grad_accum = int(training_cfg.get("grad_accum_steps", 1))
     warmup_epochs = float(scheduler_cfg.get("warmup_epochs", 0))
+    warmup_steps_cfg = int(scheduler_cfg.get("warmup_steps", 0))
+    warmup_ratio = float(scheduler_cfg.get("warmup_ratio", 0.0))
 
     steps_per_epoch = math.ceil(train_loader_len / max(1, grad_accum))
     total_steps = max(1, steps_per_epoch * epochs)
-    warmup_steps = int(steps_per_epoch * warmup_epochs)
+    if warmup_steps_cfg > 0:
+        warmup_steps = warmup_steps_cfg
+    elif warmup_ratio > 0:
+        warmup_steps = int(total_steps * warmup_ratio)
+    else:
+        warmup_steps = int(steps_per_epoch * warmup_epochs)
+    warmup_steps = max(0, min(warmup_steps, max(0, total_steps - 1)))
     min_ratio = min(1.0, max(0.0, min_lr / max(base_lr, 1e-12)))
 
     def lr_lambda(step: int) -> float:

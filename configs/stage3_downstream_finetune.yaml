@@ -16,6 +16,12 @@ data:
 training:
   epochs: 1440
   downstream_task: sleep_staging
+  early_stopping:
+    enabled: true
+    metric: macro_f1
+    mode: max
+    patience: 30
+    min_delta: 0.0
 
 finetune:
   freeze_backbone_epochs: 1440
