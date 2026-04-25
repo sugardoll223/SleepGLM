@@ -7,6 +7,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.nn import all_reduce as differentiable_all_reduce
+from torch.distributed.nn import ReduceOp
 
 from mainmodel.utils.distributed import is_main_process
 from mainmodel.utils.metrics import metrics_from_confusion, update_confusion
@@ -37,6 +39,13 @@ def _normalize_task_name(task: str | None) -> str:
     if task is None:
         return "sleep_staging"
     return str(task).strip().lower()
+
+
+def _ddp_all_reduce(x: torch.Tensor, op: str = "AVG") -> torch.Tensor:
+    if dist.is_available() and dist.is_initialized():
+        reduce_op = ReduceOp.__dict__[op.upper()]
+        return differentiable_all_reduce(x, reduce_op)
+    return x
 
 
 def build_optimizer(cfg: dict[str, Any], model: nn.Module) -> torch.optim.Optimizer:
@@ -130,6 +139,7 @@ class DDPTrainer:
         logger: Any,
         device: torch.device,
         output_dir: str,
+        amp_dtype: torch.dtype | None = None,
     ) -> None:
         self.cfg = cfg
         self.model = model
@@ -139,6 +149,7 @@ class DDPTrainer:
         self.logger = logger
         self.device = device
         self.output_dir = output_dir
+        self.amp_dtype = amp_dtype
 
         self.stage = _normalize_stage(cfg.get("experiment", {}).get("stage", "stage2_multimodal_pretrain"))
         self.training_cfg = cfg["training"]
@@ -177,27 +188,54 @@ class DDPTrainer:
             "local_views",
             ["eeg_only", "eeg_plus_eog", "missing_any_one_or_two_modalities"],
         )
+        self.stage2_view_seed = int(self.stage2_cfg.get("view_seed", cfg.get("experiment", {}).get("seed", 42)))
+        protected = set(self.stage2_cfg.get("protected_modalities", []))
+        protected.update(self.view_dropout_cfg.get("protected_modalities", []))
+        self.protected_modalities = {str(x).strip().lower() for x in protected if str(x).strip()}
         self.stage2_lambda = float(self.stage2_cfg.get("lamb", self.stage2_cfg.get("lambda_sigreg", 0.05)))
         self.stage2_lambda = min(1.0, max(0.0, self.stage2_lambda))
         self.stage2_sigreg_cfg = self.stage2_cfg.get("sigreg", {})
         self._stage2_keep_sets_logged = False
 
+    def _use_multi_view_pretrain_objective(self) -> bool:
+        return _is_stage1_eeg_jepa(self.stage) or _is_stage2_multimodal_pretrain(self.stage)
+
+    def _set_batch_norm_eval(self) -> None:
+        for module in self.model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
+
     def _normalized_downstream_task(self) -> str:
         normalized = _normalize_task_name(self.downstream_task)
         return self.downstream_task_alias.get(normalized, normalized)
 
-    def _resolve_num_classes(self, model_cfg: dict[str, Any]) -> int:
-        default = int(model_cfg.get("num_classes", 2))
+    @staticmethod
+    def _infer_head_output_dim(head: nn.Module) -> int | None:
+        if hasattr(head, "out_features"):
+            return int(head.out_features)
+        for module in reversed(list(head.modules())):
+            if isinstance(module, nn.Linear):
+                return int(module.out_features)
+        return None
+
+    def _resolve_num_classes(self, model_cfg: dict[str, Any]) -> int | None:
         task_cfg = model_cfg.get("downstream_tasks", {})
-        if not isinstance(task_cfg, dict):
-            return default
         task_name = self._normalized_downstream_task()
-        if task_name not in task_cfg:
-            return default
-        task_head_cfg = task_cfg.get(task_name, {})
-        if not isinstance(task_head_cfg, dict):
-            return default
-        return int(task_head_cfg.get("num_classes", default))
+        if isinstance(task_cfg, dict):
+            task_head_cfg = task_cfg.get(task_name, {})
+            if isinstance(task_head_cfg, dict) and "num_classes" in task_head_cfg:
+                return int(task_head_cfg["num_classes"])
+        if "num_classes" in model_cfg and model_cfg.get("num_classes") is not None:
+            return int(model_cfg["num_classes"])
+
+        core_model = _unwrap_model(self.model)
+        if hasattr(core_model, "get_task_head"):
+            try:
+                head, _ = core_model.get_task_head(task_name)
+                return self._infer_head_output_dim(head)
+            except Exception:
+                return None
+        return None
 
     def _resolve_stage1_eeg_groups(self) -> dict[str, list[int]]:
         core_model = _unwrap_model(self.model)
@@ -349,30 +387,42 @@ class DDPTrainer:
         all_modalities = list(core_model.modality_names)
         if len(all_modalities) == 0:
             return []
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(self.stage2_view_seed + int(self.global_step))
+        protected_modalities = {m for m in self.protected_modalities if m in all_modalities}
+        drop_candidates = [m for m in all_modalities if m not in protected_modalities]
 
         def _missing_any_one_or_two(num_views: int) -> list[set[str]]:
             out: list[set[str]] = []
+            if len(drop_candidates) == 0:
+                return [set(all_modalities)] if num_views > 0 else []
             for i in range(max(0, num_views)):
                 drop_n = 1 if i % 2 == 0 else 2
-                max_drop = max(1, len(all_modalities) - 1)
+                max_drop = max(1, len(drop_candidates))
                 drop_n = min(drop_n, max_drop)
-                perm = torch.randperm(len(all_modalities)).tolist()
-                drop_set = {all_modalities[j] for j in perm[:drop_n]}
+                perm = torch.randperm(len(drop_candidates), generator=generator).tolist()
+                drop_set = {drop_candidates[j] for j in perm[:drop_n]}
                 keep = set(all_modalities) - drop_set
+                keep.update(protected_modalities)
                 if len(keep) == 0:
-                    keep = {all_modalities[perm[-1]]}
+                    keep = set(protected_modalities) or {drop_candidates[perm[-1]]}
                 out.append(keep)
             return out
+
+        def _apply_protected(keep: set[str]) -> set[str]:
+            keep = {m for m in keep if m in all_modalities}
+            keep.update(protected_modalities)
+            return keep
 
         def _keep_from_spec(spec: Any) -> list[set[str]]:
             if isinstance(spec, dict):
                 if "keep" in spec:
                     keep = {str(x).strip().lower() for x in spec.get("keep", [])}
-                    keep = {m for m in keep if m in all_modalities}
+                    keep = _apply_protected(keep)
                     return [keep] if len(keep) > 0 else []
                 if "drop" in spec:
                     drop = {str(x).strip().lower() for x in spec.get("drop", [])}
-                    keep = set(all_modalities) - drop
+                    keep = _apply_protected(set(all_modalities) - drop)
                     return [keep] if len(keep) > 0 else []
                 spec_type = str(spec.get("type", "")).strip().lower()
                 if spec_type == "missing_any_one_or_two_modalities":
@@ -386,22 +436,23 @@ class DDPTrainer:
             if text == "all_modalities_present":
                 return [set(all_modalities)]
             if text == "eeg_only":
-                return [{"eeg"}] if "eeg" in all_modalities else []
+                return [_apply_protected({"eeg"})] if "eeg" in all_modalities else []
             if text in {"eeg_plus_eog", "eeg+eog"}:
                 keep = {m for m in ["eeg", "eog"] if m in all_modalities}
+                keep = _apply_protected(keep)
                 return [keep] if len(keep) > 0 else []
             if text == "missing_any_one_or_two_modalities":
                 return _missing_any_one_or_two(self.stage2_num_missing_views)
             if text.startswith("keep:"):
                 keep = {x.strip().lower() for x in text.replace("keep:", "", 1).split(",") if x.strip()}
-                keep = {m for m in keep if m in all_modalities}
+                keep = _apply_protected(keep)
                 return [keep] if len(keep) > 0 else []
             if text.startswith("drop:"):
                 drop = {x.strip().lower() for x in text.replace("drop:", "", 1).split(",") if x.strip()}
-                keep = set(all_modalities) - drop
+                keep = _apply_protected(set(all_modalities) - drop)
                 return [keep] if len(keep) > 0 else []
             tokens = {x.strip().lower() for x in text.split(",") if x.strip()}
-            keep = {m for m in tokens if m in all_modalities}
+            keep = _apply_protected(tokens)
             return [keep] if len(keep) > 0 else []
 
         keep_sets: list[set[str]] = []
@@ -438,69 +489,159 @@ class DDPTrainer:
         batch["dataset_ids"] = batch["dataset_ids"].to(self.device, non_blocking=True)
         return batch
 
+    def _resolve_view_dropout_mode_probs(self) -> dict[str, float]:
+        raw = self.view_dropout_cfg.get("mode_probs", None)
+        if isinstance(raw, dict) and len(raw) > 0:
+            probs = {
+                "none": float(raw.get("none", 0.0)),
+                "channel": float(raw.get("channel", raw.get("channel_only", 0.0))),
+                "modality": float(raw.get("modality", raw.get("modality_only", 0.0))),
+                "both": float(raw.get("both", 0.0)),
+            }
+        else:
+            p_mod = min(1.0, max(0.0, float(self.view_dropout_cfg.get("random_modality_drop_prob", 0.0))))
+            p_ch = min(1.0, max(0.0, float(self.view_dropout_cfg.get("random_channel_drop_prob", 0.0))))
+            probs = {
+                "none": (1.0 - p_mod) * (1.0 - p_ch),
+                "channel": (1.0 - p_mod) * p_ch,
+                "modality": p_mod * (1.0 - p_ch),
+                "both": p_mod * p_ch,
+            }
+
+        probs = {key: max(0.0, value) for key, value in probs.items()}
+        total = sum(probs.values())
+        if total <= 0:
+            return {"none": 1.0, "channel": 0.0, "modality": 0.0, "both": 0.0}
+        return {key: value / total for key, value in probs.items()}
+
+    def _sample_view_dropout_masks(
+        self,
+        shape: torch.Size,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        probs = self._resolve_view_dropout_mode_probs()
+        r = torch.rand(shape, device=device)
+        p_none = probs["none"]
+        p_channel = probs["channel"]
+        p_modality = probs["modality"]
+        channel_mask = (r >= p_none) & (r < p_none + p_channel)
+        modality_mask = (r >= p_none + p_channel) & (r < p_none + p_channel + p_modality)
+        both_mask = r >= (p_none + p_channel + p_modality)
+        return modality_mask | both_mask, channel_mask | both_mask
+
+    def _apply_modality_dropout_positions(
+        self,
+        batch: dict[str, Any],
+        target_mask: torch.Tensor,
+    ) -> None:
+        mod_names = list(batch["modalities"].keys())
+        if not mod_names or not target_mask.any():
+            return
+
+        positions = torch.nonzero(target_mask, as_tuple=False)
+        protected = self.protected_modalities
+        for pos in positions:
+            coord = tuple(int(x.item()) for x in pos)
+            present = [
+                mod_name
+                for mod_name in mod_names
+                if bool(batch["modality_mask"][mod_name][coord].item())
+            ]
+            if len(present) <= 1:
+                continue
+            candidates = [mod_name for mod_name in present if mod_name not in protected]
+            if len(candidates) == 0:
+                continue
+            selected = candidates[int(torch.randint(len(candidates), (1,), device=target_mask.device).item())]
+            batch["modalities"][selected][coord] = 0.0
+            batch["modality_mask"][selected][coord] = False
+            c_mask = batch.get("channel_mask", {}).get(selected, None)
+            if c_mask is not None:
+                c_mask[coord] = False
+
+    def _apply_channel_dropout_positions(
+        self,
+        batch: dict[str, Any],
+        target_mask: torch.Tensor,
+    ) -> None:
+        if not target_mask.any():
+            return
+
+        channel_cfg = self.view_dropout_cfg.get("channel_drop", {})
+        candidate_modalities = {
+            str(x).strip().lower()
+            for x in channel_cfg.get("candidate_modalities", [])
+            if str(x).strip()
+        }
+        protected_channel_modalities = {
+            str(x).strip().lower()
+            for x in channel_cfg.get("protected_modalities", [])
+            if str(x).strip()
+        }
+        min_keep = max(1, int(channel_cfg.get("min_channels_to_keep", 1)))
+        min_drop = max(1, int(channel_cfg.get("num_channels_min", channel_cfg.get("num_channels", 1))))
+        max_drop = max(min_drop, int(channel_cfg.get("num_channels_max", min_drop)))
+
+        mod_names = [
+            mod_name
+            for mod_name in batch["modalities"].keys()
+            if (not candidate_modalities or mod_name in candidate_modalities)
+            and mod_name not in protected_channel_modalities
+        ]
+        if not mod_names:
+            return
+
+        positions = torch.nonzero(target_mask, as_tuple=False)
+        for pos in positions:
+            coord = tuple(int(x.item()) for x in pos)
+            eligible: list[tuple[str, torch.Tensor]] = []
+            for mod_name in mod_names:
+                if not bool(batch["modality_mask"][mod_name][coord].item()):
+                    continue
+                x = batch["modalities"][mod_name]
+                channels = int(x.shape[-2])
+                c_mask = batch.get("channel_mask", {}).get(mod_name, None)
+                if c_mask is None:
+                    valid_channels = torch.ones(channels, dtype=torch.bool, device=x.device)
+                else:
+                    valid_channels = c_mask[coord].to(dtype=torch.bool, device=x.device)
+                if int(valid_channels.sum().item()) > min_keep:
+                    eligible.append((mod_name, valid_channels))
+
+            if not eligible:
+                continue
+            mod_name, valid_channels = eligible[int(torch.randint(len(eligible), (1,), device=target_mask.device).item())]
+            valid_idx = torch.where(valid_channels)[0]
+            max_allowed = max(0, int(valid_idx.numel()) - min_keep)
+            if max_allowed <= 0:
+                continue
+            n_drop_high = min(max_drop, max_allowed)
+            n_drop_low = min(min_drop, n_drop_high)
+            n_drop = int(torch.randint(n_drop_low, n_drop_high + 1, (1,), device=target_mask.device).item())
+            perm = torch.randperm(valid_idx.numel(), device=target_mask.device)
+            drop_channels = valid_idx[perm[:n_drop]]
+
+            x = batch["modalities"][mod_name]
+            if len(coord) == 1:
+                x[coord[0], drop_channels, :] = 0.0
+            else:
+                x[coord[0], coord[1], drop_channels, :] = 0.0
+            c_mask = batch.get("channel_mask", {}).get(mod_name, None)
+            if c_mask is not None:
+                if len(coord) == 1:
+                    c_mask[coord[0], drop_channels] = False
+                else:
+                    c_mask[coord[0], coord[1], drop_channels] = False
+
     def _apply_view_dropout(self, batch: dict[str, Any], training: bool) -> None:
         if not training:
             return
         if not bool(self.view_dropout_cfg.get("enabled", False)):
             return
-
-        force_drop = set(self.view_dropout_cfg.get("force_drop_modalities", []))
-        modality_drop_prob = float(self.view_dropout_cfg.get("random_modality_drop_prob", 0.0))
-        channel_drop_prob = float(self.view_dropout_cfg.get("random_channel_drop_prob", 0.0))
-
-        for mod_name, x in batch["modalities"].items():
-            mask = batch["modality_mask"][mod_name]
-            c_mask = batch.get("channel_mask", {}).get(mod_name, None)
-
-            if mod_name in force_drop:
-                x.zero_()
-                mask.zero_()
-                if c_mask is not None:
-                    c_mask.zero_()
-                continue
-
-            if modality_drop_prob > 0:
-                drop = (torch.rand(mask.shape, device=x.device) < modality_drop_prob) & mask
-                if drop.any():
-                    x[drop] = 0.0
-                    mask[drop] = False
-                    if c_mask is not None:
-                        c_mask[drop] = False
-
-            if channel_drop_prob > 0:
-                if mask.ndim == 1:
-                    present_indices = torch.where(mask)[0]
-                    if present_indices.numel() > 0:
-                        rand_mask = torch.rand((present_indices.numel(), x.shape[1]), device=x.device) < channel_drop_prob
-                        for local_idx, batch_idx in enumerate(present_indices):
-                            if c_mask is None:
-                                valid_channels = torch.ones(x.shape[1], dtype=torch.bool, device=x.device)
-                            else:
-                                valid_channels = c_mask[batch_idx].to(device=x.device)
-                            drop_channels = rand_mask[local_idx] & valid_channels
-                            if drop_channels.any():
-                                x[batch_idx, drop_channels, :] = 0.0
-                                if c_mask is not None:
-                                    c_mask[batch_idx, drop_channels] = False
-                elif mask.ndim == 2:
-                    present_positions = torch.nonzero(mask, as_tuple=False)
-                    if present_positions.numel() > 0:
-                        rand_mask = (
-                            torch.rand((present_positions.shape[0], x.shape[2]), device=x.device)
-                            < channel_drop_prob
-                        )
-                        for local_idx, pos in enumerate(present_positions):
-                            b_idx = int(pos[0].item())
-                            t_idx = int(pos[1].item())
-                            if c_mask is None:
-                                valid_channels = torch.ones(x.shape[2], dtype=torch.bool, device=x.device)
-                            else:
-                                valid_channels = c_mask[b_idx, t_idx].to(device=x.device)
-                            drop_channels = rand_mask[local_idx] & valid_channels
-                            if drop_channels.any():
-                                x[b_idx, t_idx, drop_channels, :] = 0.0
-                                if c_mask is not None:
-                                    c_mask[b_idx, t_idx, drop_channels] = False
+        first_mask = next(iter(batch["modality_mask"].values()))
+        modality_mask, channel_mask = self._sample_view_dropout_masks(first_mask.shape, first_mask.device)
+        self._apply_modality_dropout_positions(batch=batch, target_mask=modality_mask)
+        self._apply_channel_dropout_positions(batch=batch, target_mask=channel_mask)
 
     def _sigreg(self, proj: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
         x = proj.float()
@@ -529,8 +670,8 @@ class DDPTrainer:
         weights = weights * phi
 
         x_t = (x @ A).unsqueeze(-1) * t
-        cos_m = x_t.cos().mean(dim=-3)
-        sin_m = x_t.sin().mean(dim=-3)
+        cos_m = _ddp_all_reduce(x_t.cos().mean(dim=-3))
+        sin_m = _ddp_all_reduce(x_t.sin().mean(dim=-3))
         err = (cos_m - phi).square() + sin_m.square()
         statistic = (err @ weights) * x.size(-2)
         return statistic.mean()
@@ -694,7 +835,9 @@ class DDPTrainer:
         avg_loss = (loss_sum / sample_count.clamp_min(1.0)).item()
         return avg_loss, int(sample_count.item())
 
-    def _sync_confusion(self, confusion: torch.Tensor) -> torch.Tensor:
+    def _sync_confusion(self, confusion: torch.Tensor | None) -> torch.Tensor | None:
+        if confusion is None:
+            return None
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(confusion, op=dist.ReduceOp.SUM)
         return confusion
@@ -718,6 +861,8 @@ class DDPTrainer:
 
         if training:
             self.model.train()
+            if self._use_multi_view_pretrain_objective():
+                self._set_batch_norm_eval()
         else:
             self.model.eval()
 
@@ -728,7 +873,11 @@ class DDPTrainer:
 
         loss_sum = torch.zeros(1, device=self.device, dtype=torch.float64)
         sample_count = torch.zeros(1, device=self.device, dtype=torch.float64)
-        confusion = torch.zeros((self.num_classes, self.num_classes), device=self.device, dtype=torch.float64)
+        confusion = (
+            torch.zeros((self.num_classes, self.num_classes), device=self.device, dtype=torch.float64)
+            if self.num_classes is not None
+            else None
+        )
         aux_sums: dict[str, torch.Tensor] = {}
 
         if training:
@@ -739,7 +888,7 @@ class DDPTrainer:
             batch = self._move_batch(raw_batch)
             self._apply_view_dropout(batch, training=training)
 
-            with torch.autocast(device_type=self.device.type, enabled=use_amp):
+            with torch.autocast(device_type=self.device.type, enabled=use_amp, dtype=self.amp_dtype):
                 loss, logits_for_metrics, aux = self._compute_objective(batch=batch)
 
             if training:
@@ -756,17 +905,28 @@ class DDPTrainer:
                             self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm)
 
+                    optimizer_step_ran = False
                     if self.scaler is not None and use_amp:
+                        prev_scale = self.scaler.get_scale()
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
+                        # GradScaler may skip optimizer.step() on inf/NaN gradients.
+                        # Only advance scheduler/global_step when a parameter update happened.
+                        optimizer_step_ran = self.scaler.get_scale() >= prev_scale
                     else:
                         self.optimizer.step()
+                        optimizer_step_ran = True
+                    if optimizer_step_ran:
+                        if self.scheduler is not None:
+                            self.scheduler.step()
+                        self.global_step += 1
                     self.optimizer.zero_grad(set_to_none=True)
-                    if self.scheduler is not None:
-                        self.scheduler.step()
-                    self.global_step += 1
 
             if logits_for_metrics is not None:
+                if self.num_classes is None:
+                    self.num_classes = int(logits_for_metrics.shape[-1])
+                if confusion is None:
+                    confusion = torch.zeros((self.num_classes, self.num_classes), device=self.device, dtype=torch.float64)
                 if logits_for_metrics.ndim == 3 and batch["labels"].ndim == 2:
                     preds = torch.argmax(logits_for_metrics, dim=-1)
                     targets = batch["labels"]
@@ -816,7 +976,11 @@ class DDPTrainer:
 
         avg_loss, _ = self._sync_loss_and_count(loss_sum=loss_sum, sample_count=sample_count)
         confusion = self._sync_confusion(confusion)
-        metrics = metrics_from_confusion(confusion)
+        metrics = (
+            metrics_from_confusion(confusion)
+            if confusion is not None
+            else {"accuracy": 0.0, "macro_f1": 0.0}
+        )
         metrics["loss"] = avg_loss
         metrics["global_step"] = self.global_step
 

@@ -12,7 +12,7 @@ class Model(nn.Module):
     def __init__(self, model_cfg: dict[str, Any]) -> None:
         super().__init__()
         self.model_cfg = model_cfg
-        self.num_classes = int(model_cfg["num_classes"])
+        self.num_classes = self._resolve_default_num_classes(model_cfg)
         self.d_model = int(model_cfg["d_model"])
         self.dropout = float(model_cfg.get("dropout", 0.1))
         self.task_aliases = {
@@ -53,6 +53,7 @@ class Model(nn.Module):
         self.fusion = nn.TransformerEncoder(
             encoder_layer=encoder_layer,
             num_layers=int(tf_cfg.get("num_layers", 2)),
+            enable_nested_tensor=False,
         )
         self.norm = nn.LayerNorm(self.d_model)
 
@@ -96,6 +97,7 @@ class Model(nn.Module):
             self.temporal_encoder = nn.TransformerEncoder(
                 encoder_layer=temporal_layer,
                 num_layers=temporal_layers,
+                enable_nested_tensor=False,
             )
         else:
             self.temporal_encoder = None
@@ -110,20 +112,34 @@ class Model(nn.Module):
                 normalized = self._normalize_task_name(str(task_name))
                 if normalized in self.task_heads:
                     continue
-                out_dim = int(head_cfg_raw.get("num_classes", self.num_classes))
+                raw_out_dim = head_cfg_raw.get("num_classes", self.num_classes)
+                if raw_out_dim is None:
+                    raise ValueError(f"model.downstream_tasks.{normalized}.num_classes is required.")
+                out_dim = int(raw_out_dim)
                 head_dropout = float(head_cfg_raw.get("dropout", self.dropout))
                 self.task_heads[normalized] = nn.Sequential(
                     nn.Dropout(head_dropout),
                     nn.Linear(self.d_model, out_dim),
                 )
 
-        if "sleep_staging" not in self.task_heads:
+        if "sleep_staging" not in self.task_heads and self.num_classes is not None:
             self.task_heads["sleep_staging"] = nn.Sequential(
                 nn.Dropout(self.dropout),
                 nn.Linear(self.d_model, self.num_classes),
             )
-        # Backward-compat alias used by some older code paths.
-        self.classifier = self.task_heads["sleep_staging"]
+        if "sleep_staging" in self.task_heads:
+            # Backward-compat alias used by some older code paths.
+            self.classifier = self.task_heads["sleep_staging"]
+
+    def _resolve_default_num_classes(self, model_cfg: dict[str, Any]) -> int | None:
+        if "num_classes" in model_cfg and model_cfg.get("num_classes") is not None:
+            return int(model_cfg["num_classes"])
+        task_cfg = model_cfg.get("downstream_tasks", {})
+        if isinstance(task_cfg, dict):
+            sleep_cfg = task_cfg.get("sleep_staging", {})
+            if isinstance(sleep_cfg, dict) and "num_classes" in sleep_cfg:
+                return int(sleep_cfg["num_classes"])
+        return None
 
     def _normalize_task_name(self, task_name: str | None) -> str:
         if task_name is None:

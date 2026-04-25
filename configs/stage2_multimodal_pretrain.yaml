@@ -5,7 +5,16 @@ experiment:
   stage: stage2_multimodal_pretrain
   output_dir: outputs/mainmodel_stage2_multimodal_pretrain
 
+data:
+  # Use repository split manifest instead of placeholder /path/to/*.h5.
+  split_file: configs/splits/sleepedf.json
+  split_root_dir: dset/Sleep-EDF
+  train_files: []
+  val_files: []
+  test_files: []
+
 training:
+  amp_dtype: bfloat16
   # Stage-2 recipe metadata (for multi-view multimodal pretraining).
   stage2_multimodal:
     enabled: true
@@ -21,10 +30,22 @@ training:
       - eeg_only
       - eeg_plus_eog
       - missing_any_one_or_two_modalities
+    protected_modalities:
+      - eeg
     planned_missing_views: 6
   view_dropout:
     enabled: true
-    force_drop_modalities: []
-    random_modality_drop_prob: 0.0
-    random_channel_drop_prob: 0.0
-
+    protected_modalities:
+      - eeg
+    # Per-sample missingness scenario. EEG modality is protected above.
+    mode_probs:
+      channel: 0.25
+      modality: 0.25
+      both: 0.50
+    channel_drop:
+      # Empty means auto-select among present modalities with >1 valid channel.
+      candidate_modalities: []
+      # Drop exactly one valid channel and keep at least one channel in that modality.
+      num_channels_min: 1
+      num_channels_max: 1
+      min_channels_to_keep: 1

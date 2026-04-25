@@ -36,6 +36,18 @@ def _is_stage2_pretrain_stage(stage: str) -> bool:
     return normalized in {"pretrain", "stage2_multimodal_pretrain", "stage2"}
 
 
+def _is_multi_view_pretrain_stage(stage: str) -> bool:
+    normalized = str(stage).strip().lower()
+    return normalized in {
+        "pretrain",
+        "stage1",
+        "stage1_eeg_jepa",
+        "eeg_jepa",
+        "stage2",
+        "stage2_multimodal_pretrain",
+    }
+
+
 def _resolve_metric_mode(metric_name: str, mode: str) -> str:
     normalized = str(mode).strip().lower()
     if normalized in {"max", "min"}:
@@ -78,6 +90,29 @@ def _maybe_sync_bn(cfg: dict[str, Any], model: torch.nn.Module, distributed: boo
     return model
 
 
+def _build_grad_scaler(device: torch.device, enabled: bool) -> Any:
+    if device.type != "cuda":
+        return None
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _resolve_amp_dtype(training_cfg: dict[str, Any], device: torch.device) -> torch.dtype | None:
+    if device.type != "cuda":
+        return None
+    raw = str(training_cfg.get("amp_dtype", "float16")).strip().lower()
+    if raw in {"bf16", "bfloat16"}:
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    if raw in {"fp16", "float16", "half"}:
+        return torch.float16
+    if raw in {"fp32", "float32", "none"}:
+        return None
+    raise ValueError(f"Unsupported training.amp_dtype: {raw}")
+
+
 def _save_runtime_config(cfg: dict[str, Any], output_dir: str) -> None:
     dump_config(cfg, os.path.join(output_dir, "resolved_config.yaml"))
 
@@ -106,17 +141,63 @@ def _wrap_ddp(
     distributed: bool,
     local_rank: int,
     find_unused_parameters: bool,
+    broadcast_buffers: bool,
 ) -> torch.nn.Module:
     if not distributed:
         return model
+    _ignore_complex_buffers_for_ddp(model)
     if torch.cuda.is_available():
         return DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=find_unused_parameters,
+            broadcast_buffers=broadcast_buffers,
         )
-    return DDP(model, find_unused_parameters=find_unused_parameters)
+    return DDP(
+        model,
+        find_unused_parameters=find_unused_parameters,
+        broadcast_buffers=broadcast_buffers,
+    )
+
+
+def _ignore_complex_buffers_for_ddp(model: torch.nn.Module) -> list[str]:
+    complex_buffers = [
+        name for name, buffer in model.named_buffers() if torch.is_complex(buffer)
+    ]
+    if len(complex_buffers) == 0:
+        return []
+
+    ignored = set(getattr(model, "_ddp_params_and_buffers_to_ignore", []))
+    ignored.update(complex_buffers)
+    ignored_names = sorted(ignored)
+    if hasattr(DDP, "_set_params_and_buffers_to_ignore_for_model"):
+        DDP._set_params_and_buffers_to_ignore_for_model(model, ignored_names)
+    else:
+        model._ddp_params_and_buffers_to_ignore = ignored_names
+    return complex_buffers
+
+
+def _freeze_task_heads_for_pretrain(model: torch.nn.Module) -> None:
+    target_model = model.module if hasattr(model, "module") else model
+    task_heads = getattr(target_model, "task_heads", None)
+    if task_heads is not None:
+        for param in task_heads.parameters():
+            param.requires_grad = False
+    classifier = getattr(target_model, "classifier", None)
+    if classifier is not None:
+        for param in classifier.parameters():
+            param.requires_grad = False
+
+
+def _freeze_temporal_for_epoch_mode(model: torch.nn.Module) -> None:
+    target_model = model.module if hasattr(model, "module") else model
+    for module_name in ("temporal_encoder", "temporal_norm"):
+        module = getattr(target_model, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            param.requires_grad = False
 
 
 def _load_pretrained_if_needed(
@@ -266,9 +347,31 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
 
     _load_stage2_eeg_init_if_needed(cfg, model, logger)
     _load_pretrained_if_needed(cfg, model, logger)
+    if _is_multi_view_pretrain_stage(stage):
+        _freeze_task_heads_for_pretrain(model)
+        if is_main_process():
+            logger.info("Task heads are frozen for multi-view pretraining.")
+    if not bool(cfg.get("data", {}).get("return_sequence", False)):
+        _freeze_temporal_for_epoch_mode(model)
+        if is_main_process():
+            logger.info("Temporal modules are frozen because data.return_sequence=false.")
 
     find_unused = bool(cfg.get("training", {}).get("find_unused_parameters", False))
-    model = _wrap_ddp(model, distributed=distributed, local_rank=local_rank, find_unused_parameters=find_unused)
+    broadcast_buffers = bool(
+        cfg.get(
+            "training",
+            {},
+        ).get("broadcast_buffers", not _is_multi_view_pretrain_stage(stage))
+    )
+    if distributed and is_main_process():
+        logger.info("DDP broadcast_buffers=%s", str(broadcast_buffers))
+    model = _wrap_ddp(
+        model,
+        distributed=distributed,
+        local_rank=local_rank,
+        find_unused_parameters=find_unused,
+        broadcast_buffers=broadcast_buffers,
+    )
 
     if bool(cfg.get("training", {}).get("use_torch_compile", False)) and hasattr(torch, "compile"):
         model = torch.compile(model)
@@ -276,7 +379,9 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     optimizer = build_optimizer(cfg, model)
     scheduler, _ = build_scheduler(cfg, optimizer, train_loader_len=len(train_loader) if train_loader is not None else 0)
     use_amp = bool(cfg.get("training", {}).get("use_amp", True)) and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    amp_dtype = _resolve_amp_dtype(cfg.get("training", {}), device=device)
+    scaler_enabled = use_amp and amp_dtype == torch.float16
+    scaler = _build_grad_scaler(device=device, enabled=scaler_enabled)
 
     trainer = DDPTrainer(
         cfg=cfg,
@@ -287,6 +392,7 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         logger=logger,
         device=device,
         output_dir=output_dir,
+        amp_dtype=amp_dtype,
     )
 
     start_epoch, best_metric, global_step = _maybe_resume(
@@ -321,6 +427,7 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     freeze_epochs = int(cfg.get("finetune", {}).get("freeze_backbone_epochs", 0))
     val_interval = int(cfg["training"].get("val_interval", 1))
     save_interval = int(cfg["training"].get("save_interval", 1))
+    run_final_test = bool(cfg["training"].get("run_final_test", True))
     early_cfg = cfg["training"].get("early_stopping", {})
     early_enabled = bool(early_cfg.get("enabled", False))
     early_metric_name = str(early_cfg.get("metric", "macro_f1")).strip() or "macro_f1"
@@ -438,7 +545,7 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
             )
             break
 
-    if test_loader is not None:
+    if run_final_test and test_loader is not None:
         if is_main_process():
             logger.info("Final test evaluation starts.")
         if dist.is_available() and dist.is_initialized():
@@ -450,6 +557,8 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         test_metrics = trainer.evaluate(test_loader, epoch=epochs, split_name="test")
         if is_main_process():
             logger.info("Test metrics: %s", test_metrics)
+    elif test_loader is not None and is_main_process():
+        logger.info("Final test evaluation skipped (training.run_final_test=false).")
 
     cleanup_distributed()
 
@@ -462,4 +571,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

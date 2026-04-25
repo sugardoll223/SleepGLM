@@ -12,11 +12,13 @@ data:
     - /path/to/pretrain_val.h5
   test_files:
     - /path/to/pretrain_test.h5
-  train_batch_size: 64
-  val_batch_size: 64
+  train_batch_size: 512
+  val_batch_size: 512
 
 training:
   epochs: 80
+  # Pretraining does not require final test evaluation by default.
+  run_final_test: false
   view_dropout:
     enabled: true
     force_drop_modalities: []
@@ -26,4 +28,3 @@ training:
     lr: 3.0e-4
   scheduler:
     warmup_epochs: 8
-

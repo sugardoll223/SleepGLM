@@ -1,8 +1,18 @@
-torch>=2.2.0
-numpy>=1.24.0
-h5py>=3.10.0
-PyYAML>=6.0.0
-tqdm>=4.66.0
-scipy>=1.10.0
-pyedflib>=0.1.38
-s4torch
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.2.2+cu121
+numpy==1.26.4
+h5py==3.10.0
+PyYAML==6.0.1
+tqdm==4.66.4
+scipy==1.11.4
+pyedflib==0.1.38
+
+# 避免 setuptools 自动升级到 82+ 后和部分 torch 版本冲突
+setuptools==81.0.0
+wheel==0.43.0
+
+# s4torch 不建议直接写进 requirements.txt
+# 先单独 git clone，再用 python -m pip install --no-deps --no-build-isolation .
+# git+https://github.com/TariqAHassan/s4torch.git@v0.0.1

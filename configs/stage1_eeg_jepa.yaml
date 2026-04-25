@@ -6,12 +6,12 @@ experiment:
   output_dir: outputs/mainmodel_stage1_eeg_jepa
 
 data:
-  train_files:
-    - /path/to/stage1_train.h5
-  val_files:
-    - /path/to/stage1_val.h5
-  test_files:
-    - /path/to/stage1_test.h5
+  # Use repository split manifest instead of placeholder /path/to/*.h5.
+  split_file: configs/splits/sleepedf.json
+  split_root_dir: dset/Sleep-EDF
+  train_files: []
+  val_files: []
+  test_files: []
   train_batch_size: 64
   val_batch_size: 64
 
@@ -44,4 +44,3 @@ training:
     lr: 3.0e-4
   scheduler:
     warmup_epochs: 8
-

@@ -132,7 +132,6 @@ data:
           PPG: [PPG, PLETH]
 
 model:
-  num_classes: 5
   d_model: 256
   dropout: 0.1
   transformer:
@@ -227,7 +226,7 @@ training:
   find_unused_parameters: false
   deterministic: false
   use_torch_compile: false
-  log_interval: 20
+  log_interval: 10
   val_interval: 1
   save_interval: 1
   optimizer:
@@ -261,4 +260,3 @@ finetune:
   resume_checkpoint: ""
   freeze_backbone_epochs: 0
   lr_scale_backbone: 0.3
-

@@ -89,7 +89,3 @@ torchrun --nproc_per_node=4 -m mainmodel.train --config configs/stage3_downstrea
 - `data.split_file`: 固定划分清单（json）。
 - `data.split_root_dir`: `split_file` 中相对文件名的根目录。
 - `data.subject_id_key_candidates`: 受试者 ID 候选字段（用于统计/兼容场景）。
-
-## GitHub README 乱码
-
-本文件已改为 UTF-8 编码。若历史提交仍显示乱码，通常是旧版本文件编码导致；重新提交当前版本即可在 GitHub 正常显示。
