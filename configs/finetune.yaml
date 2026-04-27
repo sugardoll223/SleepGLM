@@ -16,8 +16,8 @@ data:
   val_batch_size: 32
 
 training:
-  # One-night sequence target length: 12h = 1440 epochs (30s per epoch).
-  epochs: 1440
+  epochs: 100
+  downstream_method: seq2seq
   view_dropout:
     enabled: false
     force_drop_modalities: []
@@ -33,4 +33,3 @@ finetune:
   resume_checkpoint: ""
   freeze_backbone_epochs: 2
   lr_scale_backbone: 0.3
-

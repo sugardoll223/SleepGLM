@@ -158,67 +158,84 @@ model:
       channel_last: false
       encoder:
         hidden_channels: 128
-        kernel_size: 7
-        stride: 2
+        kernel_size: 3
+        stride: 1
+        n_blocks: 4
+        pool_sizes: [2, 2, 2, 3]
     eog:
       in_channels: 2
       sample_rate: 100
       channel_last: false
       encoder:
-        hidden_channels: 64
-        kernel_size: 7
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [4, 6]
     emg:
       in_channels: 2
       sample_rate: 100
       channel_last: false
       encoder:
-        hidden_channels: 64
-        kernel_size: 7
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [4, 6]
     ecg:
       in_channels: 1
       sample_rate: 100
       channel_last: false
       encoder:
-        hidden_channels: 64
-        kernel_size: 7
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [4, 6]
     airflow:
       in_channels: 1
       sample_rate: 10
       channel_last: false
       encoder:
-        hidden_channels: 32
-        kernel_size: 5
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [2, 2]
     thoracoabdominal:
       in_channels: 2
       sample_rate: 10
       channel_last: false
       encoder:
-        hidden_channels: 32
-        kernel_size: 5
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [2, 2]
     spo2:
       in_channels: 1
       sample_rate: 10
       channel_last: false
       encoder:
-        hidden_channels: 32
-        kernel_size: 5
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [2, 2]
     ppg:
       in_channels: 1
       sample_rate: 10
       channel_last: false
       encoder:
-        hidden_channels: 32
-        kernel_size: 5
-        stride: 2
+        hidden_channels: 128
+        kernel_size: 3
+        stride: 1
+        n_blocks: 2
+        pool_sizes: [2, 2]
 
 training:
   downstream_task: sleep_staging
+  downstream_method: seq2seq
   epochs: 100
   grad_accum_steps: 1
   max_grad_norm: 1.0
@@ -229,6 +246,7 @@ training:
   log_interval: 10
   val_interval: 1
   save_interval: 1
+  save_epoch_checkpoints: true
   optimizer:
     name: adamw
     lr: 3.0e-4
@@ -243,8 +261,8 @@ training:
     min_lr: 1.0e-6
   early_stopping:
     enabled: false
-    metric: macro_f1
-    mode: max
+    metric: loss
+    mode: auto
     patience: 20
     min_delta: 0.0
   class_weights: []

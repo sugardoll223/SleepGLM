@@ -11,7 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from mainmodel.data.builder import build_dataloaders
 from mainmodel.engine.trainer import DDPTrainer, build_optimizer, build_scheduler
-from mainmodel.models import Model
+from mainmodel.models import Model, build_downstream_model
 from mainmodel.utils import (
     cleanup_distributed,
     dump_config,
@@ -28,7 +28,7 @@ from mainmodel.utils import (
 
 def _is_finetune_stage(stage: str) -> bool:
     normalized = str(stage).strip().lower()
-    return normalized in {"finetune", "stage3_finetune", "stage3_downstream_finetune"}
+    return normalized in {"finetune", "stage3", "stage3_finetune", "stage3_downstream_finetune"}
 
 
 def _is_stage2_pretrain_stage(stage: str) -> bool:
@@ -178,26 +178,18 @@ def _ignore_complex_buffers_for_ddp(model: torch.nn.Module) -> list[str]:
     return complex_buffers
 
 
-def _freeze_task_heads_for_pretrain(model: torch.nn.Module) -> None:
-    target_model = model.module if hasattr(model, "module") else model
-    task_heads = getattr(target_model, "task_heads", None)
-    if task_heads is not None:
-        for param in task_heads.parameters():
-            param.requires_grad = False
-    classifier = getattr(target_model, "classifier", None)
-    if classifier is not None:
-        for param in classifier.parameters():
-            param.requires_grad = False
+def _build_model_for_stage(cfg: dict[str, Any]) -> torch.nn.Module:
+    backbone = Model(cfg["model"])
+    stage = cfg.get("experiment", {}).get("stage", "stage2_multimodal_pretrain")
+    if not _is_finetune_stage(stage):
+        return backbone
 
-
-def _freeze_temporal_for_epoch_mode(model: torch.nn.Module) -> None:
-    target_model = model.module if hasattr(model, "module") else model
-    for module_name in ("temporal_encoder", "temporal_norm"):
-        module = getattr(target_model, module_name, None)
-        if module is None:
-            continue
-        for param in module.parameters():
-            param.requires_grad = False
+    method = str(cfg.get("training", {}).get("downstream_method", "seq2seq")).strip().lower()
+    return build_downstream_model(
+        backbone=backbone,
+        model_cfg=cfg["model"],
+        method=method,
+    )
 
 
 def _load_pretrained_if_needed(
@@ -213,12 +205,19 @@ def _load_pretrained_if_needed(
         return
     if not Path(ckpt_path).exists():
         raise FileNotFoundError(f"finetune.pretrained_checkpoint not found: {ckpt_path}")
-    meta = load_checkpoint(ckpt_path, model=model, strict=False, map_location="cpu")
+    target_model = model.module if hasattr(model, "module") else model
+    if hasattr(target_model, "load_pretrained_backbone_state_dict"):
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        source_state = checkpoint.get("model", checkpoint)
+        meta = target_model.load_pretrained_backbone_state_dict(source_state)
+    else:
+        meta = load_checkpoint(ckpt_path, model=model, strict=False, map_location="cpu")
     logger.info(
-        "Loaded pretrained checkpoint: %s | missing=%d | unexpected=%d",
+        "Loaded pretrained checkpoint into backbone: %s | missing=%d | unexpected=%d | ignored_downstream=%d",
         ckpt_path,
         len(meta["missing_keys"]),
         len(meta["unexpected_keys"]),
+        len(meta.get("ignored_keys", [])),
     )
 
 
@@ -283,6 +282,13 @@ def _maybe_resume(
     output_dir: str,
     logger: Any,
 ) -> tuple[int, float, int]:
+    legacy_ignored_prefixes = (
+        "temporal_encoder.",
+        "temporal_norm.",
+        "task_heads.",
+        "classifier.",
+    )
+
     resume_ckpt = str(cfg.get("finetune", {}).get("resume_checkpoint", "")).strip()
     if not resume_ckpt:
         auto_ckpt = find_latest_checkpoint(output_dir)
@@ -295,15 +301,40 @@ def _maybe_resume(
         logger.warning("Resume checkpoint not found: %s", resume_ckpt)
         return 0, float("-inf"), 0
 
-    meta = load_checkpoint(
-        resume_ckpt,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        strict=True,
-        map_location="cpu",
-    )
+    try:
+        meta = load_checkpoint(
+            resume_ckpt,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            strict=True,
+            map_location="cpu",
+        )
+    except RuntimeError:
+        meta = load_checkpoint(
+            resume_ckpt,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            strict=False,
+            map_location="cpu",
+        )
+        unexpected = list(meta.get("unexpected_keys", []))
+        missing = list(meta.get("missing_keys", []))
+        only_legacy_unexpected = all(
+            any(key.startswith(prefix) for prefix in legacy_ignored_prefixes)
+            for key in unexpected
+        )
+        if missing or not only_legacy_unexpected:
+            raise
+        logger.warning(
+            "Resume checkpoint %s contains legacy downstream keys ignored by the current model: %d unexpected keys.",
+            resume_ckpt,
+            len(unexpected),
+        )
+
     start_epoch = int(meta.get("epoch", -1)) + 1
     best_metric = float(meta.get("best_metric", float("-inf")))
     global_step = int(meta.get("global_step", 0))
@@ -341,22 +372,15 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     val_loader = loaders["val_loader"]
     test_loader = loaders["test_loader"]
 
-    model = Model(cfg["model"])
+    model = _build_model_for_stage(cfg)
     model = _maybe_sync_bn(cfg, model, distributed=distributed)
     model = model.to(device)
 
     _load_stage2_eeg_init_if_needed(cfg, model, logger)
     _load_pretrained_if_needed(cfg, model, logger)
-    if _is_multi_view_pretrain_stage(stage):
-        _freeze_task_heads_for_pretrain(model)
-        if is_main_process():
-            logger.info("Task heads are frozen for multi-view pretraining.")
-    if not bool(cfg.get("data", {}).get("return_sequence", False)):
-        _freeze_temporal_for_epoch_mode(model)
-        if is_main_process():
-            logger.info("Temporal modules are frozen because data.return_sequence=false.")
-
     find_unused = bool(cfg.get("training", {}).get("find_unused_parameters", False))
+    if _is_finetune_stage(stage) and int(cfg.get("finetune", {}).get("freeze_backbone_epochs", 0)) > 0:
+        find_unused = True
     broadcast_buffers = bool(
         cfg.get(
             "training",
@@ -364,7 +388,11 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         ).get("broadcast_buffers", not _is_multi_view_pretrain_stage(stage))
     )
     if distributed and is_main_process():
-        logger.info("DDP broadcast_buffers=%s", str(broadcast_buffers))
+        logger.info(
+            "DDP broadcast_buffers=%s find_unused_parameters=%s",
+            str(broadcast_buffers),
+            str(find_unused),
+        )
     model = _wrap_ddp(
         model,
         distributed=distributed,
@@ -427,6 +455,7 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     freeze_epochs = int(cfg.get("finetune", {}).get("freeze_backbone_epochs", 0))
     val_interval = int(cfg["training"].get("val_interval", 1))
     save_interval = int(cfg["training"].get("save_interval", 1))
+    save_epoch_checkpoints = bool(cfg["training"].get("save_epoch_checkpoints", True))
     run_final_test = bool(cfg["training"].get("run_final_test", True))
     early_cfg = cfg["training"].get("early_stopping", {})
     early_enabled = bool(early_cfg.get("enabled", False))
@@ -524,7 +553,8 @@ def run_training(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         }
 
         if (epoch + 1) % max(1, save_interval) == 0:
-            save_checkpoint(state, output_dir=output_dir, filename=f"last_epoch_{epoch:04d}.pt")
+            if save_epoch_checkpoints:
+                save_checkpoint(state, output_dir=output_dir, filename=f"last_epoch_{epoch:04d}.pt")
             save_checkpoint(state, output_dir=output_dir, filename="last.pt")
 
         if val_metrics is not None and improved:

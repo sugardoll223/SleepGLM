@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import combinations
 import math
 import time
 from typing import Any
@@ -64,7 +65,7 @@ def build_optimizer(cfg: dict[str, Any], model: nn.Module) -> torch.optim.Optimi
     for name, p in core_model.named_parameters():
         if not p.requires_grad:
             continue
-        if name.startswith("classifier") or name.startswith("task_heads"):
+        if name.startswith("classifier") or name.startswith("temporal_encoder") or name.startswith("temporal_norm"):
             head_params.append(p)
         else:
             backbone_params.append(p)
@@ -183,15 +184,36 @@ class DDPTrainer:
         self.stage1_sigreg_cfg = self.stage1_cfg.get("sigreg", {})
 
         self.stage2_num_missing_views = int(self.stage2_cfg.get("planned_missing_views", 6))
-        self.stage2_num_global_views = max(1, int(self.stage2_cfg.get("num_global_views", len(self.stage2_cfg.get("global_views", ["all_modalities_present"])))))
+        self.stage2_global_views = self.stage2_cfg.get(
+            "global_views",
+            ["all_modalities_present", "augmented_all_modalities_present"],
+        )
+        if not isinstance(self.stage2_global_views, list):
+            self.stage2_global_views = [self.stage2_global_views]
+        self.stage2_num_global_views = max(
+            1,
+            int(self.stage2_cfg.get("num_global_views", len(self.stage2_global_views))),
+        )
         self.stage2_local_views = self.stage2_cfg.get(
             "local_views",
             ["eeg_only", "eeg_plus_eog", "missing_any_one_or_two_modalities"],
         )
         self.stage2_view_seed = int(self.stage2_cfg.get("view_seed", cfg.get("experiment", {}).get("seed", 42)))
-        protected = set(self.stage2_cfg.get("protected_modalities", []))
-        protected.update(self.view_dropout_cfg.get("protected_modalities", []))
-        self.protected_modalities = {str(x).strip().lower() for x in protected if str(x).strip()}
+        self.stage2_keep_set_protected_modalities = {
+            str(x).strip().lower()
+            for x in self.stage2_cfg.get("protected_modalities", [])
+            if str(x).strip()
+        }
+        self.view_dropout_protected_modalities = {
+            str(x).strip().lower()
+            for x in self.view_dropout_cfg.get("protected_modalities", [])
+            if str(x).strip()
+        }
+        self.stage2_global_aug_cfg = self.stage2_cfg.get("global_augmentation", {})
+        self.modality_sample_rates = {
+            str(mod_name).strip().lower(): int(mod_cfg.get("sample_rate", 1))
+            for mod_name, mod_cfg in cfg.get("model", {}).get("modalities", {}).items()
+        }
         self.stage2_lambda = float(self.stage2_cfg.get("lamb", self.stage2_cfg.get("lambda_sigreg", 0.05)))
         self.stage2_lambda = min(1.0, max(0.0, self.stage2_lambda))
         self.stage2_sigreg_cfg = self.stage2_cfg.get("sigreg", {})
@@ -235,6 +257,9 @@ class DDPTrainer:
                 return self._infer_head_output_dim(head)
             except Exception:
                 return None
+        classifier = getattr(core_model, "classifier", None)
+        if classifier is not None:
+            return self._infer_head_output_dim(classifier)
         return None
 
     def _resolve_stage1_eeg_groups(self) -> dict[str, list[int]]:
@@ -382,6 +407,239 @@ class DDPTrainer:
                     channel_view[mod_name] = torch.zeros_like(c)
         return modalities_view, mask_view, channel_view
 
+    def _clone_batch_for_view(self, batch: dict[str, Any]) -> dict[str, Any]:
+        cloned: dict[str, Any] = {}
+        for key, value in batch.items():
+            if key in {"modalities", "modality_mask", "channel_mask"} and isinstance(value, dict):
+                cloned[key] = {name: tensor.clone() for name, tensor in value.items()}
+            else:
+                cloned[key] = value
+        return cloned
+
+    def _resolve_stage2_global_view_spec(self, view_index: int) -> str:
+        if len(self.stage2_global_views) == 0:
+            return "all_modalities_present"
+        spec = self.stage2_global_views[min(view_index, len(self.stage2_global_views) - 1)]
+        return str(spec).strip().lower()
+
+    def _resolve_stage2_global_aug_op_cfg(self, mod_name: str, op_name: str) -> dict[str, Any]:
+        base_cfg = self.stage2_global_aug_cfg.get(op_name, {})
+        if not isinstance(base_cfg, dict):
+            base_cfg = {}
+        overrides = self.stage2_global_aug_cfg.get("modality_overrides", {})
+        mod_override = overrides.get(mod_name, {}) if isinstance(overrides, dict) else {}
+        op_override = mod_override.get(op_name, {}) if isinstance(mod_override, dict) else {}
+        if not isinstance(op_override, dict):
+            op_override = {}
+        merged = dict(base_cfg)
+        merged.update(op_override)
+        return merged
+
+    @staticmethod
+    def _roll_with_zero_fill(x: torch.Tensor, shift: int) -> torch.Tensor:
+        if shift == 0:
+            return x
+        out = torch.roll(x, shifts=shift, dims=-1)
+        if shift > 0:
+            out[..., :shift] = 0.0
+        else:
+            out[..., shift:] = 0.0
+        return out
+
+    @staticmethod
+    def _apply_band_stop_to_signal(
+        x: torch.Tensor,
+        sample_rate: int,
+        low_hz: float,
+        high_hz: float,
+        attenuation: float,
+    ) -> torch.Tensor:
+        if sample_rate <= 0 or x.shape[-1] <= 1 or high_hz <= low_hz:
+            return x
+        spec = torch.fft.rfft(x, dim=-1)
+        freqs = torch.fft.rfftfreq(x.shape[-1], d=1.0 / float(sample_rate)).to(device=x.device)
+        band_mask = (freqs >= low_hz) & (freqs <= high_hz)
+        if not bool(band_mask.any().item()):
+            return x
+        spec[..., band_mask] = spec[..., band_mask] * attenuation
+        filtered = torch.fft.irfft(spec, n=x.shape[-1], dim=-1)
+        return filtered.to(dtype=x.dtype)
+
+    def _augment_stage2_modality_signal(
+        self,
+        mod_name: str,
+        x: torch.Tensor,
+        modality_mask: torch.Tensor,
+        channel_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not bool(self.stage2_global_aug_cfg.get("enabled", False)):
+            return x
+
+        sample_rate = max(1, int(self.modality_sample_rates.get(mod_name, 1)))
+        default_prob = float(self.stage2_global_aug_cfg.get("per_transform_prob", 0.5))
+
+        original_shape = x.shape
+        if x.ndim == 3:
+            flat_x = x.clone()
+            flat_mask = modality_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
+            flat_channel_mask = channel_mask.reshape(-1, channel_mask.shape[-1]) if channel_mask is not None else None
+        elif x.ndim == 4:
+            flat_x = x.reshape(-1, x.shape[-2], x.shape[-1]).clone()
+            flat_mask = modality_mask.reshape(-1).to(device=x.device, dtype=torch.bool)
+            flat_channel_mask = channel_mask.reshape(-1, channel_mask.shape[-1]) if channel_mask is not None else None
+        else:
+            return x
+
+        present_idx = torch.where(flat_mask)[0]
+        if present_idx.numel() == 0:
+            return x
+        if flat_channel_mask is not None:
+            flat_x = flat_x * flat_channel_mask.unsqueeze(-1).to(dtype=flat_x.dtype)
+
+        num_steps = flat_x.shape[-1]
+
+        def _sample_selected(prob: float) -> torch.Tensor:
+            prob = min(1.0, max(0.0, prob))
+            if prob <= 0.0 or present_idx.numel() == 0:
+                return present_idx[:0]
+            select_mask = torch.rand((present_idx.numel(),), device=flat_x.device) < prob
+            return present_idx[select_mask]
+
+        scale_cfg = self._resolve_stage2_global_aug_op_cfg(mod_name, "amplitude_scaling")
+        if bool(scale_cfg.get("enabled", True)):
+            selected = _sample_selected(float(scale_cfg.get("prob", default_prob)))
+            if selected.numel() > 0:
+                scale_min = float(scale_cfg.get("min", 0.8))
+                scale_max = float(scale_cfg.get("max", 1.2))
+                if scale_max < scale_min:
+                    scale_min, scale_max = scale_max, scale_min
+                scales = torch.empty((selected.numel(), 1, 1), device=flat_x.device, dtype=flat_x.dtype).uniform_(scale_min, scale_max)
+                flat_x[selected] = flat_x[selected] * scales
+
+        shift_cfg = self._resolve_stage2_global_aug_op_cfg(mod_name, "time_shift")
+        if bool(shift_cfg.get("enabled", True)):
+            selected = _sample_selected(float(shift_cfg.get("prob", default_prob)))
+            max_seconds = max(0.0, float(shift_cfg.get("max_seconds", 3.0)))
+            max_shift = min(max(0, num_steps - 1), int(round(sample_rate * max_seconds)))
+            if selected.numel() > 0 and max_shift > 0:
+                shifts = torch.randint(-max_shift, max_shift + 1, (selected.numel(),), device=flat_x.device)
+                for row_idx, shift in zip(selected.tolist(), shifts.tolist()):
+                    flat_x[row_idx] = self._roll_with_zero_fill(flat_x[row_idx], int(shift))
+
+        shift_bias_cfg = self._resolve_stage2_global_aug_op_cfg(mod_name, "amplitude_shift")
+        if bool(shift_bias_cfg.get("enabled", True)):
+            selected = _sample_selected(float(shift_bias_cfg.get("prob", default_prob)))
+            if selected.numel() > 0:
+                bias_min = float(shift_bias_cfg.get("min", -0.2))
+                bias_max = float(shift_bias_cfg.get("max", 0.2))
+                if bias_max < bias_min:
+                    bias_min, bias_max = bias_max, bias_min
+                bias = torch.empty((selected.numel(), 1, 1), device=flat_x.device, dtype=flat_x.dtype).uniform_(bias_min, bias_max)
+                flat_x[selected] = flat_x[selected] + bias
+
+        zero_mask_cfg = self._resolve_stage2_global_aug_op_cfg(mod_name, "zero_mask")
+        if bool(zero_mask_cfg.get("enabled", True)):
+            selected = _sample_selected(float(zero_mask_cfg.get("prob", default_prob)))
+            max_seconds = max(0.0, float(zero_mask_cfg.get("max_seconds", 3.0)))
+            max_mask_len = min(num_steps, int(round(sample_rate * max_seconds)))
+            if selected.numel() > 0 and max_mask_len > 0:
+                mask_lens = torch.randint(0, max_mask_len + 1, (selected.numel(),), device=flat_x.device)
+                for row_idx, mask_len in zip(selected.tolist(), mask_lens.tolist()):
+                    if mask_len <= 0:
+                        continue
+                    start_max = max(1, num_steps - int(mask_len) + 1)
+                    start = int(torch.randint(start_max, (1,), device=flat_x.device).item())
+                    flat_x[row_idx, :, start : start + int(mask_len)] = 0.0
+
+        noise_cfg = self._resolve_stage2_global_aug_op_cfg(mod_name, "additive_gaussian_noise")
+        if bool(noise_cfg.get("enabled", True)):
+            selected = _sample_selected(float(noise_cfg.get("prob", default_prob)))
+            if selected.numel() > 0:
+                sigma_min = max(0.0, float(noise_cfg.get("sigma_min", 0.0)))
+                sigma_max = max(sigma_min, float(noise_cfg.get("sigma_max", 0.1)))
+                sigma = torch.empty((selected.numel(), 1, 1), device=flat_x.device, dtype=flat_x.dtype).uniform_(sigma_min, sigma_max)
+                noise = torch.randn_like(flat_x[selected]) * sigma
+                flat_x[selected] = flat_x[selected] + noise
+
+        band_stop_cfg = self._resolve_stage2_global_aug_op_cfg(mod_name, "band_stop")
+        if bool(band_stop_cfg.get("enabled", True)):
+            min_sample_rate = max(1, int(band_stop_cfg.get("min_sample_rate", 20)))
+            if sample_rate >= min_sample_rate:
+                selected = _sample_selected(float(band_stop_cfg.get("prob", default_prob)))
+                band_width_hz = max(0.0, float(band_stop_cfg.get("width_hz", 2.0)))
+                lower_min = max(0.0, float(band_stop_cfg.get("lower_hz_min", 0.5)))
+                lower_max = max(lower_min, float(band_stop_cfg.get("lower_hz_max", 30.0)))
+                attenuation = float(band_stop_cfg.get("attenuation", 0.0))
+                nyquist = 0.5 * float(sample_rate)
+                effective_lower_max = min(lower_max, max(lower_min, nyquist - band_width_hz))
+                if selected.numel() > 0 and band_width_hz > 0 and effective_lower_max >= lower_min:
+                    for row_idx in selected.tolist():
+                        if effective_lower_max == lower_min:
+                            low_hz = lower_min
+                        else:
+                            low_hz = float(
+                                torch.empty((1,), device=flat_x.device, dtype=flat_x.dtype).uniform_(
+                                    lower_min,
+                                    effective_lower_max,
+                                ).item()
+                            )
+                        high_hz = min(nyquist, low_hz + band_width_hz)
+                        if high_hz <= low_hz:
+                            continue
+                        flat_x[row_idx] = self._apply_band_stop_to_signal(
+                            flat_x[row_idx],
+                            sample_rate=sample_rate,
+                            low_hz=low_hz,
+                            high_hz=high_hz,
+                            attenuation=attenuation,
+                        )
+
+        if flat_channel_mask is not None:
+            flat_x = flat_x * flat_channel_mask.unsqueeze(-1).to(dtype=flat_x.dtype)
+
+        if len(original_shape) == 3:
+            return flat_x
+        return flat_x.reshape(original_shape)
+
+    def _apply_stage2_global_augmentation(
+        self,
+        batch: dict[str, Any],
+        training: bool,
+    ) -> None:
+        if not training:
+            return
+        if not bool(self.stage2_global_aug_cfg.get("enabled", False)):
+            return
+        core_model = _unwrap_model(self.model)
+        for mod_name in core_model.modality_names:
+            x = batch["modalities"].get(mod_name, None)
+            m = batch["modality_mask"].get(mod_name, None)
+            if x is None or m is None:
+                continue
+            c = batch.get("channel_mask", {}).get(mod_name, None)
+            batch["modalities"][mod_name] = self._augment_stage2_modality_signal(
+                mod_name=mod_name,
+                x=x,
+                modality_mask=m,
+                channel_mask=c,
+            )
+
+    def _build_stage2_global_view(
+        self,
+        batch: dict[str, Any],
+        training: bool,
+        view_index: int,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
+        view_batch = self._clone_batch_for_view(batch)
+        spec = self._resolve_stage2_global_view_spec(view_index)
+        if spec in {"augmented_all_modalities_present", "augmented_all_modalities", "augmented"}:
+            self._apply_stage2_global_augmentation(view_batch, training=training)
+        return (
+            view_batch["modalities"],
+            view_batch["modality_mask"],
+            view_batch.get("channel_mask"),
+        )
+
     def _build_stage2_keep_sets(self) -> list[set[str]]:
         core_model = _unwrap_model(self.model)
         all_modalities = list(core_model.modality_names)
@@ -389,23 +647,48 @@ class DDPTrainer:
             return []
         generator = torch.Generator(device="cpu")
         generator.manual_seed(self.stage2_view_seed + int(self.global_step))
-        protected_modalities = {m for m in self.protected_modalities if m in all_modalities}
+        protected_modalities = {m for m in self.stage2_keep_set_protected_modalities if m in all_modalities}
         drop_candidates = [m for m in all_modalities if m not in protected_modalities]
 
         def _missing_any_one_or_two(num_views: int) -> list[set[str]]:
             out: list[set[str]] = []
+            requested = max(0, num_views)
             if len(drop_candidates) == 0:
-                return [set(all_modalities)] if num_views > 0 else []
-            for i in range(max(0, num_views)):
-                drop_n = 1 if i % 2 == 0 else 2
-                max_drop = max(1, len(drop_candidates))
-                drop_n = min(drop_n, max_drop)
-                perm = torch.randperm(len(drop_candidates), generator=generator).tolist()
-                drop_set = {drop_candidates[j] for j in perm[:drop_n]}
+                return [set(all_modalities)] if requested > 0 else []
+
+            one_drop_choices = [{mod_name} for mod_name in drop_candidates]
+            two_drop_choices = [set(pair) for pair in combinations(drop_candidates, 2)]
+            seen_drop_keys: set[tuple[str, ...]] = set()
+
+            for i in range(requested):
+                desired_drop_n = 1 if i % 2 == 0 else 2
+                if desired_drop_n == 1 or len(two_drop_choices) == 0:
+                    candidate_pool = one_drop_choices
+                else:
+                    candidate_pool = two_drop_choices
+
+                available = [drop for drop in candidate_pool if tuple(sorted(drop)) not in seen_drop_keys]
+                if len(available) == 0:
+                    fallback_pool = one_drop_choices if len(one_drop_choices) > 0 else [set(drop_candidates)]
+                    available = [drop for drop in fallback_pool if tuple(sorted(drop)) not in seen_drop_keys]
+
+                if len(available) > 0:
+                    choice_idx = int(torch.randint(len(available), (1,), generator=generator).item())
+                    drop_set = set(available[choice_idx])
+                else:
+                    max_drop = max(1, len(drop_candidates))
+                    actual_drop_n = min(desired_drop_n, max_drop)
+                    perm = torch.randperm(len(drop_candidates), generator=generator).tolist()
+                    drop_set = {drop_candidates[j] for j in perm[:actual_drop_n]}
+
+                seen_drop_keys.add(tuple(sorted(drop_set)))
                 keep = set(all_modalities) - drop_set
                 keep.update(protected_modalities)
                 if len(keep) == 0:
-                    keep = set(protected_modalities) or {drop_candidates[perm[-1]]}
+                    keep = set(protected_modalities)
+                    if len(keep) == 0:
+                        fallback_idx = int(torch.randint(len(drop_candidates), (1,), generator=generator).item())
+                        keep = {drop_candidates[fallback_idx]}
                 out.append(keep)
             return out
 
@@ -414,8 +697,63 @@ class DDPTrainer:
             keep.update(protected_modalities)
             return keep
 
+        def _random_drop_from_subset(
+            base_keep: set[str],
+            drop_from: list[str],
+            num_views: int,
+            min_drop: int,
+            max_drop: int,
+        ) -> list[set[str]]:
+            out: list[set[str]] = []
+            requested = max(0, num_views)
+            if requested == 0:
+                return out
+
+            keep_base = _apply_protected(base_keep)
+            subset = [m for m in drop_from if m in all_modalities and m not in keep_base]
+            if len(subset) == 0:
+                return [keep_base] if len(keep_base) > 0 else [set(all_modalities)]
+
+            drop_sizes = [size for size in range(max(1, min_drop), max(1, max_drop) + 1) if size <= len(subset)]
+            if len(drop_sizes) == 0:
+                drop_sizes = [1]
+            drop_pool = [set(combo) for size in drop_sizes for combo in combinations(subset, size)]
+            seen_drop_keys: set[tuple[str, ...]] = set()
+
+            for _ in range(requested):
+                available = [drop for drop in drop_pool if tuple(sorted(drop)) not in seen_drop_keys]
+                if len(available) > 0:
+                    choice_idx = int(torch.randint(len(available), (1,), generator=generator).item())
+                    drop_set = set(available[choice_idx])
+                else:
+                    drop_n = drop_sizes[int(torch.randint(len(drop_sizes), (1,), generator=generator).item())]
+                    perm = torch.randperm(len(subset), generator=generator).tolist()
+                    drop_set = {subset[j] for j in perm[:drop_n]}
+
+                seen_drop_keys.add(tuple(sorted(drop_set)))
+                keep = _apply_protected(set(all_modalities) - drop_set)
+                keep.update(keep_base)
+                out.append(_apply_protected(keep))
+            return out
+
         def _keep_from_spec(spec: Any) -> list[set[str]]:
             if isinstance(spec, dict):
+                spec_type = str(spec.get("type", "")).strip().lower()
+                if spec_type == "missing_any_one_or_two_modalities":
+                    n = int(spec.get("num_views", self.stage2_num_missing_views))
+                    return _missing_any_one_or_two(n)
+                if spec_type in {"drop_random_non_core_modalities", "drop_random_modalities"}:
+                    base_keep = {str(x).strip().lower() for x in spec.get("keep", []) if str(x).strip()}
+                    drop_from = [str(x).strip().lower() for x in spec.get("drop_from", []) if str(x).strip()]
+                    if len(drop_from) == 0:
+                        drop_from = [m for m in all_modalities if m not in base_keep]
+                    return _random_drop_from_subset(
+                        base_keep=base_keep,
+                        drop_from=drop_from,
+                        num_views=int(spec.get("num_views", 1)),
+                        min_drop=int(spec.get("min_drop", 1)),
+                        max_drop=int(spec.get("max_drop", spec.get("min_drop", 1))),
+                    )
                 if "keep" in spec:
                     keep = {str(x).strip().lower() for x in spec.get("keep", [])}
                     keep = _apply_protected(keep)
@@ -424,10 +762,6 @@ class DDPTrainer:
                     drop = {str(x).strip().lower() for x in spec.get("drop", [])}
                     keep = _apply_protected(set(all_modalities) - drop)
                     return [keep] if len(keep) > 0 else []
-                spec_type = str(spec.get("type", "")).strip().lower()
-                if spec_type == "missing_any_one_or_two_modalities":
-                    n = int(spec.get("num_views", self.stage2_num_missing_views))
-                    return _missing_any_one_or_two(n)
                 return []
 
             text = str(spec).strip().lower()
@@ -539,7 +873,7 @@ class DDPTrainer:
             return
 
         positions = torch.nonzero(target_mask, as_tuple=False)
-        protected = self.protected_modalities
+        protected = self.view_dropout_protected_modalities
         for pos in positions:
             coord = tuple(int(x.item()) for x in pos)
             present = [
@@ -742,12 +1076,17 @@ class DDPTrainer:
         batch: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
         global_embs = []
-        for _ in range(self.stage2_num_global_views):
+        for view_index in range(self.stage2_num_global_views):
+            modalities_view, mask_view, channel_view = self._build_stage2_global_view(
+                batch=batch,
+                training=self.model.training,
+                view_index=view_index,
+            )
             global_embs.append(
                 self._extract_fused_feature(
-                    modalities=batch["modalities"],
-                    modality_mask=batch["modality_mask"],
-                    channel_mask=batch.get("channel_mask"),
+                    modalities=modalities_view,
+                    modality_mask=mask_view,
+                    channel_mask=channel_view,
                 )
             )
 

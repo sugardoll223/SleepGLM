@@ -81,11 +81,15 @@ torchrun --nproc_per_node=4 -m mainmodel.train --config configs/stage2_multimoda
 
 # stage3（下游微调）
 torchrun --nproc_per_node=4 -m mainmodel.train --config configs/stage3_downstream_finetune.yaml
+
+# stage3 线性 baseline（单 epoch 分类，不使用时序 Transformer）
+torchrun --nproc_per_node=4 -m mainmodel.train --config configs/stage3_linear_finetune.yaml
 ```
 
 ## 关键配置说明
 
 - `training.downstream_task`: 当前支持 `sleep_staging`。
+- `training.downstream_method`: `seq2seq` 为主方法；`linear` 为单 epoch 线性 baseline。
 - `data.split_file`: 固定划分清单（json）。
 - `data.split_root_dir`: `split_file` 中相对文件名的根目录。
 - `data.subject_id_key_candidates`: 受试者 ID 候选字段（用于统计/兼容场景）。

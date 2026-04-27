@@ -1,0 +1,33 @@
+_base_: finetune.yaml
+
+experiment:
+  name: mainmodel_stage3_linear_finetune
+  stage: stage3_downstream_finetune
+  output_dir: outputs/mainmodel_stage3_linear_finetune
+
+data:
+  split_file: configs/splits/sleepedf.json
+  split_root_dir: dset/Sleep-EDF
+  # Linear baseline: classify each 30s epoch independently.
+  return_sequence: false
+  sequence_label_pad_value: -100
+  # Linear batch size is measured in 30s epochs.
+  train_batch_size: 512
+  val_batch_size: 512
+  test_batch_size: 512
+  drop_last: false
+
+training:
+  epochs: 100
+  downstream_task: sleep_staging
+  downstream_method: linear
+  early_stopping:
+    enabled: true
+    metric: loss
+    mode: min
+    patience: 30
+    min_delta: 0.0
+
+finetune:
+  # Train only the linear head for 2 epochs, then allow backbone finetuning.
+  freeze_backbone_epochs: 2

@@ -9,20 +9,26 @@ data:
   # Use pre-generated split manifest.
   split_file: configs/splits/sleepedf.json
   split_root_dir: dset/Sleep-EDF
+  # Main downstream method: sequence-to-sequence sleep staging.
   return_sequence: true
   sequence_label_pad_value: -100
+  # Seq2seq batch size is measured in full sequences (roughly one record/night).
+  train_batch_size: 32
+  val_batch_size: 32
+  test_batch_size: 32
   drop_last: false
 
 training:
-  epochs: 1440
+  epochs: 100
   downstream_task: sleep_staging
+  downstream_method: seq2seq
   early_stopping:
     enabled: true
-    metric: macro_f1
-    mode: max
+    metric: loss
+    mode: min
     patience: 30
     min_delta: 0.0
 
 finetune:
-  freeze_backbone_epochs: 1440
-
+  # Warm up the downstream prediction head, then unfreeze the backbone.
+  freeze_backbone_epochs: 2

@@ -14,7 +14,16 @@ data:
   test_files: []
 
 training:
+  # Max epochs. Early stopping below can stop the run before this.
+  epochs: 80
   amp_dtype: bfloat16
+  save_epoch_checkpoints: false
+  early_stopping:
+    enabled: true
+    metric: loss
+    mode: min
+    patience: 10
+    min_delta: 0.0
   # Stage-2 recipe metadata (for multi-view multimodal pretraining).
   stage2_multimodal:
     enabled: true
@@ -24,20 +33,85 @@ training:
     stage1_checkpoint: ""
     # LeJEPA trade-off weight: total = (1-lamb)*pred_loss + lamb*sigreg_loss
     lamb: 0.05
+    # 2 global views + 6 local views = 8 total views.
+    num_global_views: 2
     global_views:
       - all_modalities_present
+      - augmented_all_modalities_present
+    global_augmentation:
+      enabled: true
+      per_transform_prob: 0.5
+      amplitude_scaling:
+        min: 0.8
+        max: 1.2
+      time_shift:
+        max_seconds: 3.0
+      amplitude_shift:
+        min: -0.2
+        max: 0.2
+      zero_mask:
+        max_seconds: 3.0
+      additive_gaussian_noise:
+        sigma_min: 0.0
+        sigma_max: 0.1
+      band_stop:
+        enabled: true
+        width_hz: 2.0
+        lower_hz_min: 0.5
+        lower_hz_max: 30.0
+        min_sample_rate: 20
+      modality_overrides:
+        airflow:
+          time_shift:
+            max_seconds: 1.0
+          zero_mask:
+            max_seconds: 1.0
+          band_stop:
+            enabled: false
+        thoracoabdominal:
+          time_shift:
+            max_seconds: 1.0
+          zero_mask:
+            max_seconds: 1.0
+          band_stop:
+            enabled: false
+        spo2:
+          amplitude_scaling:
+            min: 0.95
+            max: 1.05
+          amplitude_shift:
+            min: -0.05
+            max: 0.05
+          time_shift:
+            enabled: false
+          zero_mask:
+            max_seconds: 0.5
+          band_stop:
+            enabled: false
+        ppg:
+          time_shift:
+            max_seconds: 1.0
+          zero_mask:
+            max_seconds: 1.0
+          band_stop:
+            enabled: false
     local_views:
       - eeg_only
-      - eeg_plus_eog
-      - missing_any_one_or_two_modalities
-    protected_modalities:
-      - eeg
-    planned_missing_views: 6
+      - drop:eeg
+      - drop:eeg,emg
+      - type: drop_random_non_core_modalities
+        keep: [eeg, eog, emg]
+        drop_from: [ecg, airflow, thoracoabdominal, spo2, ppg]
+        min_drop: 1
+        max_drop: 2
+        num_views: 3
+    protected_modalities: []
+    planned_missing_views: 0
   view_dropout:
-    enabled: true
-    protected_modalities:
-      - eeg
-    # Per-sample missingness scenario. EEG modality is protected above.
+    # Stage2 global augmentation now handles signal perturbation, and local views
+    # handle modality missingness directly.
+    enabled: false
+    protected_modalities: []
     mode_probs:
       channel: 0.25
       modality: 0.25

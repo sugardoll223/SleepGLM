@@ -12,13 +12,8 @@ class Model(nn.Module):
     def __init__(self, model_cfg: dict[str, Any]) -> None:
         super().__init__()
         self.model_cfg = model_cfg
-        self.num_classes = self._resolve_default_num_classes(model_cfg)
         self.d_model = int(model_cfg["d_model"])
         self.dropout = float(model_cfg.get("dropout", 0.1))
-        self.task_aliases = {
-            "staging": "sleep_staging",
-            "sleep_stage_classification": "sleep_staging",
-        }
 
         modalities_cfg = model_cfg.get("modalities", {})
         self.modality_names = list(modalities_cfg.keys())
@@ -82,84 +77,6 @@ class Model(nn.Module):
         self.interaction_k = nn.Linear(self.d_model, self.d_model, bias=False)
         self.interaction_v = nn.Linear(self.d_model, self.d_model, bias=False)
         self.interaction_out = nn.Linear(self.d_model, self.d_model, bias=False)
-        temporal_cfg = model_cfg.get("temporal", {})
-        self.use_temporal_context = bool(temporal_cfg.get("enabled", True))
-        temporal_layers = int(temporal_cfg.get("num_layers", 2))
-        if self.use_temporal_context and temporal_layers > 0:
-            temporal_layer = nn.TransformerEncoderLayer(
-                d_model=self.d_model,
-                nhead=int(temporal_cfg.get("nhead", tf_cfg.get("nhead", 8))),
-                dim_feedforward=int(temporal_cfg.get("dim_feedforward", 4 * self.d_model)),
-                dropout=self.dropout,
-                batch_first=True,
-                norm_first=True,
-            )
-            self.temporal_encoder = nn.TransformerEncoder(
-                encoder_layer=temporal_layer,
-                num_layers=temporal_layers,
-                enable_nested_tensor=False,
-            )
-        else:
-            self.temporal_encoder = None
-        self.temporal_norm = nn.LayerNorm(self.d_model)
-
-        self.task_heads = nn.ModuleDict()
-        task_cfg = model_cfg.get("downstream_tasks", {})
-        if isinstance(task_cfg, dict):
-            for task_name, head_cfg_raw in task_cfg.items():
-                if not isinstance(head_cfg_raw, dict):
-                    head_cfg_raw = {}
-                normalized = self._normalize_task_name(str(task_name))
-                if normalized in self.task_heads:
-                    continue
-                raw_out_dim = head_cfg_raw.get("num_classes", self.num_classes)
-                if raw_out_dim is None:
-                    raise ValueError(f"model.downstream_tasks.{normalized}.num_classes is required.")
-                out_dim = int(raw_out_dim)
-                head_dropout = float(head_cfg_raw.get("dropout", self.dropout))
-                self.task_heads[normalized] = nn.Sequential(
-                    nn.Dropout(head_dropout),
-                    nn.Linear(self.d_model, out_dim),
-                )
-
-        if "sleep_staging" not in self.task_heads and self.num_classes is not None:
-            self.task_heads["sleep_staging"] = nn.Sequential(
-                nn.Dropout(self.dropout),
-                nn.Linear(self.d_model, self.num_classes),
-            )
-        if "sleep_staging" in self.task_heads:
-            # Backward-compat alias used by some older code paths.
-            self.classifier = self.task_heads["sleep_staging"]
-
-    def _resolve_default_num_classes(self, model_cfg: dict[str, Any]) -> int | None:
-        if "num_classes" in model_cfg and model_cfg.get("num_classes") is not None:
-            return int(model_cfg["num_classes"])
-        task_cfg = model_cfg.get("downstream_tasks", {})
-        if isinstance(task_cfg, dict):
-            sleep_cfg = task_cfg.get("sleep_staging", {})
-            if isinstance(sleep_cfg, dict) and "num_classes" in sleep_cfg:
-                return int(sleep_cfg["num_classes"])
-        return None
-
-    def _normalize_task_name(self, task_name: str | None) -> str:
-        if task_name is None:
-            return "sleep_staging"
-        normalized = str(task_name).strip().lower()
-        if normalized == "":
-            return "sleep_staging"
-        return self.task_aliases.get(normalized, normalized)
-
-    def get_supported_tasks(self) -> list[str]:
-        return sorted(list(self.task_heads.keys()))
-
-    def get_task_head(self, task_name: str | None) -> tuple[nn.Module, str]:
-        normalized = self._normalize_task_name(task_name)
-        if normalized not in self.task_heads:
-            raise KeyError(
-                f"Unknown downstream task '{task_name}'. "
-                f"Supported tasks: {self.get_supported_tasks()}"
-            )
-        return self.task_heads[normalized], normalized
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -274,7 +191,7 @@ class Model(nn.Module):
         seq_padding_mask: torch.Tensor | None = None,
         task_name: str = "sleep_staging",
         return_features: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
         first_modality = next(iter(self.modality_names))
         x0 = modalities[first_modality]
         is_sequence = x0.ndim == 4
@@ -287,11 +204,9 @@ class Model(nn.Module):
                 channel_mask=channel_mask,
             )
             pooled = self.fuse_tokens(tokens=tokens, padding_mask=padding_mask)
-            head, _ = self.get_task_head(task_name)
-            logits = head(pooled)
             if return_features:
-                return logits, pooled
-            return logits
+                return None, pooled
+            return pooled
 
         batch_size, seq_len = x0.shape[0], x0.shape[1]
         flat_modalities: dict[str, torch.Tensor] = {}
@@ -328,24 +243,9 @@ class Model(nn.Module):
         pooled_flat = self.fuse_tokens(tokens=tokens, padding_mask=padding_mask)
         features = pooled_flat.reshape(batch_size, seq_len, self.d_model)
 
-        if seq_padding_mask is None:
-            valid_t = None
-            for mod_name in self.modality_names:
-                m = modality_mask[mod_name].to(dtype=torch.bool, device=features.device)
-                valid_t = m if valid_t is None else (valid_t | m)
-            seq_padding_mask = ~valid_t
-        else:
-            seq_padding_mask = seq_padding_mask.to(dtype=torch.bool, device=features.device)
-
-        if self.temporal_encoder is not None:
-            features = self.temporal_encoder(features, src_key_padding_mask=seq_padding_mask)
-        features = self.temporal_norm(features)
-
-        head, _ = self.get_task_head(task_name)
-        logits = head(features)
         if return_features:
-            return logits, features
-        return logits
+            return None, features
+        return features
 
     def freeze_backbone(self, freeze: bool = True) -> None:
         modules = [
@@ -356,14 +256,9 @@ class Model(nn.Module):
             self.interaction_k,
             self.interaction_v,
             self.interaction_out,
-            self.temporal_encoder,
-            self.temporal_norm,
         ]
         for module in modules:
             if module is None:
                 continue
             for p in module.parameters():
                 p.requires_grad = not freeze
-        for head in self.task_heads.values():
-            for p in head.parameters():
-                p.requires_grad = True
