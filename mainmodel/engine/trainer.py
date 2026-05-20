@@ -1261,6 +1261,7 @@ class DDPTrainer:
                         self.global_step += 1
                     self.optimizer.zero_grad(set_to_none=True)
 
+            batch_acc = 0.0
             if logits_for_metrics is not None:
                 if self.num_classes is None:
                     self.num_classes = int(logits_for_metrics.shape[-1])
@@ -1278,6 +1279,8 @@ class DDPTrainer:
                 else:
                     preds = torch.argmax(logits_for_metrics, dim=1)
                     targets = batch["labels"]
+                if targets.numel() > 0:
+                    batch_acc = float((preds == targets).to(dtype=torch.float32).mean().item())
                 confusion = update_confusion(confusion, preds=preds, targets=targets, num_classes=self.num_classes)
 
             if batch["labels"].ndim == 2:
@@ -1298,17 +1301,24 @@ class DDPTrainer:
                     aux_sums[key] = torch.zeros(1, device=self.device, dtype=torch.float64)
                 aux_sums[key] += val.to(dtype=torch.float64) * bs
 
-            if training and is_main_process() and ((step + 1) % log_interval == 0):
+            should_log_step = (
+                step == 0
+                or ((step + 1) % max(1, log_interval) == 0)
+                or (step + 1 == len(loader))
+            )
+            if training and is_main_process() and should_log_step:
                 elapsed = max(1e-6, time.time() - start_time)
                 seen = int(sample_count.item())
                 aux_msg = " ".join([f"{k}={float(v):.4f}" for k, v in aux.items()])
+                aux_part = f" | {aux_msg}" if aux_msg else ""
                 self.logger.info(
-                    "train step=%d/%d | epoch=%d | loss=%.6f | %s | samples=%d | speed=%.2f sample/s",
+                    "train step=%d/%d | epoch=%d | loss=%.6f | acc=%.4f%s | samples=%d | speed=%.2f sample/s",
                     step + 1,
                     len(loader),
                     epoch,
                     float(loss.item()),
-                    aux_msg,
+                    batch_acc,
+                    aux_part,
                     seen,
                     seen / elapsed,
                 )

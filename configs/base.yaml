@@ -246,7 +246,7 @@ training:
   log_interval: 10
   val_interval: 1
   save_interval: 1
-  save_epoch_checkpoints: true
+  save_epoch_checkpoints: false
   optimizer:
     name: adamw
     lr: 3.0e-4

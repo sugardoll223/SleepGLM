@@ -12,22 +12,24 @@ data:
   return_sequence: false
   sequence_label_pad_value: -100
   # Linear batch size is measured in 30s epochs.
-  train_batch_size: 512
-  val_batch_size: 512
-  test_batch_size: 512
+  train_batch_size: 2048
+  val_batch_size: 2048
+  test_batch_size: 2048
   drop_last: false
 
 training:
   epochs: 100
   downstream_task: sleep_staging
   downstream_method: linear
+  log_interval: 1
+  save_epoch_checkpoints: false
   early_stopping:
     enabled: true
     metric: loss
     mode: min
-    patience: 30
+    patience: 10
     min_delta: 0.0
 
 finetune:
   # Train only the linear head for 2 epochs, then allow backbone finetuning.
-  freeze_backbone_epochs: 2
+  freeze_backbone_epochs: 100

@@ -13,22 +13,24 @@ data:
   return_sequence: true
   sequence_label_pad_value: -100
   # Seq2seq batch size is measured in full sequences (roughly one record/night).
-  train_batch_size: 32
-  val_batch_size: 32
-  test_batch_size: 32
+  train_batch_size: 1
+  val_batch_size: 1
+  test_batch_size: 1
   drop_last: false
 
 training:
   epochs: 100
   downstream_task: sleep_staging
   downstream_method: seq2seq
+  log_interval: 1
+  save_epoch_checkpoints: false
   early_stopping:
     enabled: true
     metric: loss
     mode: min
-    patience: 30
+    patience: 10
     min_delta: 0.0
 
 finetune:
   # Warm up the downstream prediction head, then unfreeze the backbone.
-  freeze_backbone_epochs: 2
+  freeze_backbone_epochs: 100

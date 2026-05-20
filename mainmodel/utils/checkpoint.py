@@ -51,9 +51,10 @@ def find_latest_checkpoint(output_dir: str) -> str | None:
     out_dir = Path(output_dir)
     if not out_dir.exists():
         return None
-    candidates = sorted(out_dir.glob("last_epoch_*.pt"))
+    candidates = list(out_dir.glob("last_epoch_*.pt"))
+    fallback = out_dir / "last.pt"
+    if fallback.exists():
+        candidates.append(fallback)
     if not candidates:
-        fallback = out_dir / "last.pt"
-        return str(fallback) if fallback.exists() else None
-    return str(candidates[-1])
-
+        return None
+    return str(max(candidates, key=lambda path: path.stat().st_mtime))
